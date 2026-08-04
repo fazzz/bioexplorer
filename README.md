@@ -38,9 +38,11 @@ uv run bio status
 | `bio structure` | PDB/mmCIF解析(配列抽出・RMSD・二次構造・conservation mapping)+ 予測/ビューア外部連携 |
 | `bio embed` | Sequence Space: k-mer/MinHash/ESM/ProtT5埋め込み + PCA/t-SNE/UMAP |
 | `bio plot` | Alignment Viewer / Phylogenetic Tree / Sequence Space(+ `bio profile --plot`でLogo/Heatmap/Conservation Plot) |
+| `bio annotate` | ORF/CDS・GT-AG intron候補・TATA box(DNA/RNA、内蔵)、Signal Peptide/TM領域/Coiled Coil/Low Complexity/PROSITE風motif(protein、内蔵)、Pfam(ローカルHMMER)/UniProt/InterPro(外部DB・API連携) |
+| `bio db` | BLAST/MMseqs2/Pfamの公式ダウンローダのラッパー(`bio search --db`/`bio annotate pfam`用) |
 | `bio replay` | 記録済みワークフロー(`.bioexplorer/log.json`)の再実行・再現性検証 |
 
-未実装: Sequence Annotation(CDS/Domain/Motif認識、外部DB連携)。
+仕様書の全21セクションを実装完了。
 
 ## テスト
 

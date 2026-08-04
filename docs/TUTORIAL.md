@@ -301,7 +301,55 @@ RMSD: 0.000 A over 5 equivalent CA atoms
 
 実際の構造で試すには2.3の方法で本物のPDBファイルを取得してください。DSSPやVMD等の外部ツールが入っていれば、そのまま`bio structure ss`/`bio structure view`が使えます。
 
-### 3.11 replay
+### 3.11 annotate(Sequence Annotation)
+
+**DNA/RNA(内蔵アルゴリズム、外部DB不要)**:
+
+```bash
+$ bio annotate orf --min-length 10
+AF191659.1  2 orf(s)  longest=23aa
+...
+$ bio annotate promoter --search-window 156
+AF191659.1  3 hit(s)
+...
+-- 7/7 record(s) have a candidate TATA box
+```
+
+Opuntiaデータ(葉緑体イントロン領域)ではGT-AG候補イントロンは0件でした。これは正しい挙動です — このデータ自体がすでにイントロン内部の断片なので、その中にさらに別のイントロン境界が見つからなくて当然です。
+
+**Protein(内蔵アルゴリズム)**: 実際に2本の膜貫通ヘリックスを持つことが知られている大腸菌ATP合成酵素サブユニットC(PDB 1A91、`Tests/Fasta/f001`からNCBI/PDBの実データを取得)で試すと:
+
+```bash
+$ curl "https://raw.githubusercontent.com/biopython/biopython/master/Tests/Fasta/f001" -o atpsynthase.fasta
+$ bio import atpsynthase.fasta
+$ bio annotate protein-features
+gi|3318709|pdb|1A91|  signal=False  tm=2  coiled_coil=2  low_complexity=3
+```
+
+内蔵のKyte-Doolittle疎水性スキャンだけで、実際の膜貫通ヘリックス2本(残基14-24, 59-79付近)を検出できています。単純な閾値ベースのヒューリスティックですが、この程度の検証には十分機能することが分かります。
+
+```bash
+$ bio annotate motif --list      # 内蔵PROSITE風パターン一覧
+$ bio annotate motif             # 全パターンでスキャン
+```
+
+**外部DB/API連携**(この環境にはHMMER/インターネット経路がないため未検証、コードはドキュメント通りに実装):
+
+```bash
+# Pfamドメイン注釈(要HMMER + Pfam-A.hmm)
+bio db fetch --tool pfam --output ./pfam/Pfam-A.hmm    # 約1.5GB、hmmpressまで自動実行
+bio annotate pfam --hmm-db ./pfam/Pfam-A.hmm
+
+# UniProt単体lookup
+bio annotate uniprot P01308 --export insulin.json
+
+# InterPro(EBI REST API、メールアドレス必須 -- EBI側の利用規約)
+bio annotate interpro --email you@example.com
+```
+
+`bio replay`では`annotate`グループもデフォルトで`--skip`対象です(pfam/uniprot/interproがネットワーク・外部DB依存のため、structureのGUI起動と同じ扱い)。
+
+### 3.12 replay
 
 ```bash
 $ bio replay --dry-run

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import click
 
+from . import annotate as bio_annotate
+from . import annotate_external
 from . import db as bio_db
 from . import io as bio_io
 from . import project
@@ -677,7 +679,7 @@ def plot_tree_cmd(tree_file, name, no_confidence, output) -> None:
 @click.option("--dry-run", is_flag=True, help="Print what would run without executing anything.")
 @click.option("--from", "from_index", type=int, default=None, help="1-based step number to start from.")
 @click.option("--to", "to_index", type=int, default=None, help="1-based step number to stop at (inclusive).")
-@click.option("--skip", "skip_str", default=None, help="Comma-separated top-level commands to skip (default: 'structure,replay' -- interactive viewer + self-recursion).")
+@click.option("--skip", "skip_str", default=None, help="Comma-separated top-level commands to skip (default: 'structure,annotate,replay' -- interactive viewer, external DB/network calls, and self-recursion).")
 @click.option("--continue-on-error", is_flag=True, help="Keep going past a failed step instead of stopping.")
 @click.option("--no-reset", is_flag=True, help="Replay on top of the current project state instead of rebuilding from scratch.")
 def replay_cmd(dry_run, from_index, to_index, skip_str, continue_on_error, no_reset) -> None:
@@ -687,7 +689,7 @@ def replay_cmd(dry_run, from_index, to_index, skip_str, continue_on_error, no_re
         skip_commands = {s.strip() for s in skip_str.split(",") if s.strip()}
     else:
         from .replay import DEFAULT_SKIP
-        skip_commands = DEFAULT_SKIP | {"structure"}
+        skip_commands = DEFAULT_SKIP | {"structure", "annotate"}
 
     try:
         report = run_replay(
@@ -812,20 +814,27 @@ def db_group() -> None:
 
 
 @db_group.command("fetch")
-@click.argument("name")
-@click.option("--tool", required=True, type=click.Choice(["blast", "mmseqs"]), help="Which downloader to use.")
-@click.option("--output", "output_path", type=click.Path(path_type=Path), required=True, help="Output DB prefix/directory.")
+@click.argument("name", required=False)
+@click.option("--tool", required=True, type=click.Choice(["blast", "mmseqs", "pfam"]), help="Which downloader to use.")
+@click.option("--output", "output_path", type=click.Path(path_type=Path), required=True, help="Output DB prefix/directory (blast/mmseqs) or .hmm file path (pfam).")
 def db_fetch_cmd(name, tool, output_path) -> None:
     """Download a public DB (e.g. `bio db fetch nr --tool blast --output
-    ./blastdb/nr`, or `bio db fetch UniRef50 --tool mmseqs --output
-    ./mmseqs_db/uniref50`). See `bio db list` for common names; each
-    tool's full catalog is larger and changes over time."""
+    ./blastdb/nr`, `bio db fetch UniRef50 --tool mmseqs --output
+    ./mmseqs_db/uniref50`, or `bio db fetch --tool pfam --output
+    ./pfam/Pfam-A.hmm` -- NAME is ignored for --tool pfam, there's only
+    one Pfam-A.hmm). See `bio db list` for common names; each tool's full
+    catalog is larger and changes over time."""
+    if tool != "pfam" and not name:
+        raise click.ClickException(f"--tool {tool} needs a NAME argument (see `bio db list`)")
     try:
-        result_path = bio_db.fetch_db(tool, name, output_path)
+        result_path = bio_db.fetch_db(tool, name or "", output_path)
     except RuntimeError as e:
         raise click.ClickException(str(e))
-    click.echo(f"downloaded {name} ({tool}) -> {result_path}")
-    click.echo(f"use it with: bio search QUERY --method {'blast' if tool == 'blast' else 'mmseqs'} --db {result_path}")
+    click.echo(f"downloaded {name or 'Pfam-A.hmm'} ({tool}) -> {result_path}")
+    if tool == "pfam":
+        click.echo(f"use it with: bio annotate pfam --hmm-db {result_path}")
+    else:
+        click.echo(f"use it with: bio search QUERY --method {tool} --db {result_path}")
 
 
 @db_group.command("list")
@@ -838,6 +847,247 @@ def db_list_cmd() -> None:
     for name in bio_db.COMMON_MMSEQS_DBS:
         click.echo(f"  {name}")
     click.echo("(not exhaustive -- run `update_blastdb.pl --showall` or `mmseqs databases` with no args for the full catalog)")
+
+
+@main.group("annotate")
+def annotate_group() -> None:
+    """Sequence annotation (spec section 9). Classic in-process algorithms
+    (orf/intron/promoter for DNA-RNA; protein-features/motif for protein)
+    need nothing beyond Biopython. pfam/uniprot/interpro talk to a
+    downloaded DB or a remote service -- see docs/TUTORIAL.md."""
+
+
+def _annotate_targets(seq_type: str | None, tag: str | None):
+    collection = project.load_collection()
+    targets = collection
+    if seq_type:
+        targets = targets.filter(lambda r: r.seq_type.value == seq_type)
+    if tag:
+        targets = targets.filter(lambda r: r.has_tag(tag))
+    records = list(targets)
+    if not records:
+        raise click.ClickException("no records matched the given filters")
+    return collection, records
+
+
+@annotate_group.command("orf")
+@click.option("--tag", default=None, help="Restrict to records with this tag.")
+@click.option("--min-length", type=int, default=30, help="Minimum ORF protein length (residues).")
+@click.option("--single-strand", is_flag=True, help="Only scan the given strand (default: both).")
+def annotate_orf_cmd(tag, min_length, single_strand) -> None:
+    """Find candidate ORFs/CDS in DNA/RNA records (ATG...stop scan, all
+    reading frames)."""
+    collection, records = _annotate_targets(None, tag)
+    records = [r for r in records if r.seq_type.value in ("dna", "rna")]
+    if not records:
+        raise click.ClickException("no dna/rna records matched")
+    n_with_orf = 0
+    for rec in records:
+        hits = bio_annotate.find_orfs(rec.sequence, min_protein_length=min_length, both_strands=not single_strand)
+        rec.set("orfs", [{"start": h.start, "end": h.end, "strand": h.strand, "frame": h.frame, "protein_length": len(h.protein), "protein": h.protein} for h in hits])
+        if hits:
+            rec.add_tag("has_orf")
+            n_with_orf += 1
+        click.echo(f"{rec.name}\t{len(hits)} orf(s)" + (f"\tlongest={len(hits[0].protein)}aa" if hits else ""))
+    project.save_collection(collection)
+    project.log_command()
+    click.echo(f"-- {n_with_orf}/{len(records)} record(s) have at least one ORF", err=True)
+
+
+@annotate_group.command("intron")
+@click.option("--tag", default=None, help="Restrict to records with this tag.")
+@click.option("--min-len", "min_len", type=int, default=20)
+@click.option("--max-len", "max_len", type=int, default=5000)
+def annotate_intron_cmd(tag, min_len, max_len) -> None:
+    """Find candidate introns via the canonical GT...AG splice-site
+    consensus (a boundary heuristic, not real gene prediction -- expect
+    many candidates on real genomic sequence)."""
+    collection, records = _annotate_targets(None, tag)
+    records = [r for r in records if r.seq_type.value in ("dna", "rna")]
+    if not records:
+        raise click.ClickException("no dna/rna records matched")
+    n_with_hit = 0
+    for rec in records:
+        hits = bio_annotate.find_canonical_introns(rec.sequence, min_intron_len=min_len, max_intron_len=max_len)
+        rec.set("introns", [{"start": h.start, "end": h.end, "length": h.length} for h in hits])
+        if hits:
+            rec.add_tag("has_intron_candidate")
+            n_with_hit += 1
+        click.echo(f"{rec.name}\t{len(hits)} candidate(s)")
+    project.save_collection(collection)
+    project.log_command()
+    click.echo(f"-- {n_with_hit}/{len(records)} record(s) have at least one candidate", err=True)
+
+
+@annotate_group.command("promoter")
+@click.option("--tag", default=None, help="Restrict to records with this tag.")
+@click.option("--search-window", type=int, default=100, help="Bases from the sequence's end to search (pass in the region upstream of a presumed TSS).")
+def annotate_promoter_cmd(tag, search_window) -> None:
+    """Scan for a TATA-box-like motif near the end of DNA/RNA records."""
+    collection, records = _annotate_targets(None, tag)
+    records = [r for r in records if r.seq_type.value in ("dna", "rna")]
+    if not records:
+        raise click.ClickException("no dna/rna records matched")
+    n_with_hit = 0
+    for rec in records:
+        hits = bio_annotate.find_tata_box(rec.sequence, search_window=search_window)
+        rec.set("promoter_hits", [{"position": h.position, "motif": h.motif, "offset_from_end": h.offset_from_end} for h in hits])
+        if hits:
+            rec.add_tag("has_tata_box")
+            n_with_hit += 1
+        click.echo(f"{rec.name}\t{len(hits)} hit(s)")
+    project.save_collection(collection)
+    project.log_command()
+    click.echo(f"-- {n_with_hit}/{len(records)} record(s) have a candidate TATA box", err=True)
+
+
+@annotate_group.command("protein-features")
+@click.option("--tag", default=None, help="Restrict to records with this tag.")
+@click.option("--tm-threshold", type=float, default=1.6)
+@click.option("--cc-threshold", type=float, default=1.0)
+@click.option("--lc-entropy", type=float, default=3.0)
+def annotate_protein_features_cmd(tag, tm_threshold, cc_threshold, lc_entropy) -> None:
+    """Signal peptide + transmembrane regions + coiled coil + low-complexity
+    regions, in one pass over protein records."""
+    collection, records = _annotate_targets("protein", tag)
+    for rec in records:
+        sig = bio_annotate.predict_signal_peptide(rec.sequence)
+        tm = bio_annotate.find_transmembrane_regions(rec.sequence, threshold=tm_threshold)
+        cc = bio_annotate.find_coiled_coil(rec.sequence, threshold=cc_threshold)
+        lc = bio_annotate.find_low_complexity_regions(rec.sequence, entropy_threshold=lc_entropy)
+
+        rec.set("signal_peptide", {"is_signal_peptide": sig.is_signal_peptide, "cleavage_site": sig.cleavage_site, "score": sig.score})
+        rec.set("tm_regions", [{"start": r.start, "end": r.end, "mean_hydropathy": round(r.mean_hydropathy, 3)} for r in tm])
+        rec.set("coiled_coil_regions", [{"start": r.start, "end": r.end, "score": round(r.score, 3)} for r in cc])
+        rec.set("low_complexity_regions", [{"start": r.start, "end": r.end, "entropy": round(r.entropy, 3)} for r in lc])
+
+        if sig.is_signal_peptide:
+            rec.add_tag("signal_peptide")
+        if tm:
+            rec.add_tag("transmembrane")
+        if cc:
+            rec.add_tag("coiled_coil")
+        if lc:
+            rec.add_tag("low_complexity")
+
+        click.echo(f"{rec.name}\tsignal={sig.is_signal_peptide}\ttm={len(tm)}\tcoiled_coil={len(cc)}\tlow_complexity={len(lc)}")
+    project.save_collection(collection)
+    project.log_command()
+
+
+@annotate_group.command("motif")
+@click.option("--tag", default=None, help="Restrict to records with this tag.")
+@click.option("--patterns", default=None, help="Comma-separated pattern IDs (default: all built-in patterns). See `bio annotate motif --list`.")
+@click.option("--list", "list_patterns", is_flag=True, help="List the built-in pattern IDs and exit.")
+def annotate_motif_cmd(tag, patterns, list_patterns) -> None:
+    """Scan protein records against a small built-in PROSITE-style pattern
+    set (N-glycosylation, kinase phosphorylation sites, Walker A, C2H2
+    zinc finger, ...). Not the real PROSITE database -- see `bio annotate
+    interpro` for the real thing."""
+    if list_patterns:
+        for pid, name in bio_annotate.list_prosite_patterns().items():
+            click.echo(f"{pid}\t{name}")
+        return
+
+    collection, records = _annotate_targets("protein", tag)
+    pattern_ids = [p.strip() for p in patterns.split(",")] if patterns else None
+    n_with_hit = 0
+    for rec in records:
+        try:
+            hits = bio_annotate.scan_prosite_patterns(rec.sequence, pattern_ids=pattern_ids)
+        except ValueError as e:
+            raise click.ClickException(str(e))
+        rec.set("motifs", [{"pattern_id": h.pattern_id, "name": h.name, "start": h.start, "end": h.end, "matched_text": h.matched_text} for h in hits])
+        for h in hits:
+            rec.add_tag(f"motif:{h.pattern_id}")
+        if hits:
+            n_with_hit += 1
+        click.echo(f"{rec.name}\t{len(hits)} hit(s)")
+    project.save_collection(collection)
+    project.log_command()
+    click.echo(f"-- {n_with_hit}/{len(records)} record(s) have at least one motif hit", err=True)
+
+
+@annotate_group.command("pfam")
+@click.option("--hmm-db", "hmm_db_path", type=click.Path(exists=True, path_type=Path), required=True, help="Path to a pressed Pfam-A.hmm (see `bio db fetch --tool pfam`).")
+@click.option("--tag", default=None, help="Restrict to records with this tag.")
+@click.option("--evalue", type=float, default=1e-3)
+def annotate_pfam_cmd(hmm_db_path, tag, evalue) -> None:
+    """Domain annotation via a local Pfam-A.hmm scan (HMMER's hmmscan).
+    Untested from this environment -- HMMER + a real Pfam-A.hmm aren't
+    available here; the subprocess/parsing follows hmmscan's documented
+    --domtblout format."""
+    collection, records = _annotate_targets("protein", tag)
+    with __import__("tempfile").TemporaryDirectory() as tmp:
+        fasta_path = Path(tmp) / "query.fasta"
+        bio_io.write_fasta(BioCollection(records), fasta_path)
+        try:
+            hits = annotate_external.run_hmmscan(fasta_path, hmm_db_path, evalue=evalue)
+        except RuntimeError as e:
+            raise click.ClickException(str(e))
+
+    by_query: dict[str, list] = {}
+    for h in hits:
+        by_query.setdefault(h.query_id, []).append(h)
+    for rec in records:
+        rec_hits = by_query.get(rec.name, [])
+        rec.set("pfam_domains", [{"name": h.domain_name, "accession": h.domain_accession, "evalue": h.evalue, "score": h.score, "start": h.start, "end": h.end} for h in rec_hits])
+        for h in rec_hits:
+            rec.add_tag(f"domain:{h.domain_accession}")
+        click.echo(f"{rec.name}\t{len(rec_hits)} domain(s)")
+    project.save_collection(collection)
+    project.log_command()
+
+
+@annotate_group.command("uniprot")
+@click.argument("accession")
+@click.option("--export", "export_path", type=click.Path(path_type=Path), default=None, help="Write the full raw JSON record to this path.")
+def annotate_uniprot_cmd(accession, export_path) -> None:
+    """Look up a single UniProtKB entry by accession. Standalone (not
+    project-based) -- untested from this environment (no network route to
+    rest.uniprot.org here)."""
+    try:
+        entry = annotate_external.fetch_uniprot(accession)
+    except RuntimeError as e:
+        raise click.ClickException(str(e))
+    summary = annotate_external.summarize_uniprot_entry(entry)
+    click.echo(f"accession: {summary['accession']}")
+    click.echo(f"name: {summary['name']}")
+    click.echo(f"organism: {summary['organism']}")
+    click.echo(f"genes: {', '.join(g for g in summary['genes'] if g)}")
+    click.echo(f"length: {summary['sequence_length']}")
+    click.echo(f"Pfam domains: {', '.join(summary['pfam_domains']) or '(none)'}")
+    if export_path is not None:
+        import json as json_mod
+        with open(export_path, "w") as fh:
+            json_mod.dump(entry, fh, indent=2)
+        click.echo(f"exported full record to {export_path}")
+
+
+@annotate_group.command("interpro")
+@click.option("--tag", default=None, help="Restrict to records with this tag.")
+@click.option("--email", required=True, help="Contact email (required by EBI's job dispatcher).")
+@click.option("--timeout", type=float, default=300.0, help="Max seconds to wait per sequence.")
+@click.option("--interval", type=float, default=10.0, help="Polling interval in seconds.")
+def annotate_interpro_cmd(tag, email, timeout, interval) -> None:
+    """Domain/family annotation via the EBI InterProScan5 REST service, one
+    project protein record at a time (submit -> poll -> fetch per
+    sequence; can take minutes per sequence). Untested from this
+    environment (no network route to ebi.ac.uk here)."""
+    collection, records = _annotate_targets("protein", tag)
+    for rec in records:
+        click.echo(f"{rec.name}: submitting...")
+        try:
+            result = annotate_external.run_interproscan(rec.sequence, email=email, title=rec.name, timeout=timeout, interval=interval)
+        except (RuntimeError, TimeoutError, ValueError) as e:
+            click.echo(f"{rec.name}: FAILED -- {e}", err=True)
+            continue
+        rec.set("interpro", result)
+        rec.add_tag("interpro_annotated")
+        n_matches = len(result.get("results", [{}])[0].get("matches", [])) if result.get("results") else 0
+        click.echo(f"{rec.name}: {n_matches} match(es)")
+    project.save_collection(collection)
+    project.log_command()
 
 
 if __name__ == "__main__":

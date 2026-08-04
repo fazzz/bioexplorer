@@ -8,6 +8,9 @@ reimplement a downloader when the tools already ship official ones:
 - MMseqs2: ``mmseqs databases``, which fetches and formats a curated list
   (UniRef50/90/100, UniProtKB, PDB seqres, Pfam-A, ...) directly into an
   mmseqs DB ready for ``bio search --method mmseqs --db``.
+- Pfam: no official downloader script exists, so this fetches
+  Pfam-A.hmm.gz from EBI's FTP directly and runs `hmmpress` on it,
+  producing what `bio annotate pfam` needs.
 
 DIAMOND has no downloader of its own -- build a DIAMOND DB from any FASTA
 you already have (e.g. one fetched via update_blastdb.pl --decompress, or
@@ -16,7 +19,10 @@ downloaded from UniProt directly) with ``diamond makedb``.
 
 from __future__ import annotations
 
+import gzip
+import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 from .similarity import _require_tool
@@ -25,6 +31,8 @@ from .similarity import _require_tool
 # both tools' full catalogs are large and change over time.
 COMMON_BLAST_DBS = ("nr", "nt", "swissprot", "pdbaa", "pdbnt", "refseq_protein", "refseq_rna")
 COMMON_MMSEQS_DBS = ("UniRef50", "UniRef90", "UniRef100", "UniProtKB", "PDB", "Pfam-A.full")
+
+_PFAM_A_HMM_URL = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz"
 
 
 def fetch_blast_db(name: str, output_dir: Path, decompress: bool = True) -> Path:
@@ -56,9 +64,33 @@ def fetch_mmseqs_db(name: str, output_prefix: Path, tmp_dir: Path | None = None)
     return output_prefix
 
 
+def fetch_pfam_hmm(output_path: Path, url: str = _PFAM_A_HMM_URL, timeout: float = 60.0) -> Path:
+    """Download Pfam-A.hmm.gz from EBI's FTP, decompress it, and run
+    hmmpress so it's ready for `bio annotate pfam --hmm-db`. `output_path`
+    is the .hmm file to create (e.g. ./pfam/Pfam-A.hmm) -- this is a large
+    download (~1.5GB compressed)."""
+    hmmpress_binary = _require_tool("hmmpress")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    gz_path = output_path.with_suffix(output_path.suffix + ".gz")
+
+    try:
+        urllib.request.urlretrieve(url, str(gz_path))
+    except OSError as e:
+        raise RuntimeError(f"could not download {url}: {e}") from e
+
+    with gzip.open(gz_path, "rb") as src, open(output_path, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    gz_path.unlink()
+
+    subprocess.run([hmmpress_binary, str(output_path)], check=True, capture_output=True, text=True)
+    return output_path
+
+
 def fetch_db(tool: str, name: str, output_path: Path, **kwargs) -> Path:
     if tool == "blast":
         return fetch_blast_db(name, output_path, **kwargs)
     if tool == "mmseqs":
         return fetch_mmseqs_db(name, output_path, **kwargs)
-    raise ValueError(f"unknown tool: {tool} (choose from 'blast', 'mmseqs')")
+    if tool == "pfam":
+        return fetch_pfam_hmm(output_path, **kwargs)
+    raise ValueError(f"unknown tool: {tool} (choose from 'blast', 'mmseqs', 'pfam')")
