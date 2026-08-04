@@ -172,6 +172,25 @@ note: examples/opuntia/opuntia_raw.fasta has 7 sequences; using the first ('AF19
 -- 3 hit(s) (method=kmer)
 ```
 
+**公共DBに対する検索**: `--method blast/diamond/mmseqs`はデフォルトではプロジェクト内の配列から一時DBを作って検索しますが、`--db`で既存のDBを指定すれば、NCBI nr/nt、UniRef、Pfam等の公共DBに対してそのまま検索できます。DBは各ツール公式のダウンローダを`bio db fetch`でラップしています(車輪の再発明はしていません):
+
+```bash
+# BLAST用DBをダウンロード(update_blastdb.plのラッパー)
+bio db fetch swissprot --tool blast --output ./blastdb/swissprot
+
+# MMseqs2用DBをダウンロード(mmseqs databasesのラッパー)
+bio db fetch UniRef50 --tool mmseqs --output ./mmseqs_db/uniref50
+
+# ダウンロードしたDBに対して検索
+bio search query.fasta --method blast --db ./blastdb/swissprot --program blastn
+bio search query.fasta --method mmseqs --db ./mmseqs_db/uniref50
+
+# よく使うDB名の一覧
+bio db list
+```
+
+外部DBに対する検索結果は、プロジェクト内の配列とは限らない(むしろ大半は含まれない)ため、`--type`/`--tag`等のプロジェクト向けフィルタは適用されず、素の`hit_id`とスコアがそのまま表示されます。`--export hits.csv`で保存可能です。DIAMONDには専用ダウンローダがないため、`update_blastdb.pl --decompress`等で落としたFASTAから`diamond makedb`で自分でDBを作る運用になります。
+
 ### 3.4 align(pairwise)
 
 ```bash

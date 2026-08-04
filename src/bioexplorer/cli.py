@@ -13,6 +13,7 @@ from pathlib import Path
 
 import click
 
+from . import db as bio_db
 from . import io as bio_io
 from . import project
 from . import structure as bio_structure
@@ -134,6 +135,9 @@ def descriptor_cmd(seq_type: str | None) -> None:
 @click.option("--k", "kmer_k", type=int, default=None, help="k-mer length for kmer/minhash methods.")
 @click.option("--top-n", type=int, default=10, help="Max hits to return for similarity search.")
 @click.option("--min-score", type=float, default=0.0, help="Minimum similarity score (0-1) for kmer/minhash methods.")
+@click.option("--db", "db_path", type=click.Path(), default=None, help="Search an existing prebuilt DB instead of the project (blast: DB prefix; diamond: .dmnd file; mmseqs: DB prefix). See `bio db fetch`. Ignored for --method kmer/minhash.")
+@click.option("--program", default="blastn", type=click.Choice(["blastn", "blastp", "blastx", "tblastn", "tblastx"]), help="BLAST program (--method blast only).")
+@click.option("--export", "export_path", type=click.Path(path_type=Path), default=None, help="Write hits (id, score) to this CSV -- mainly useful with --db, where hits may not be in the project.")
 @click.option("--name", default=None, help="Substring or (with --name-regex) regex match on name.")
 @click.option("--name-regex", is_flag=True)
 @click.option("--tag", default=None, help="Require this tag.")
@@ -146,41 +150,19 @@ def descriptor_cmd(seq_type: str | None) -> None:
 @click.option("--field-max", type=float, default=None)
 @click.option("--field-equals", default=None)
 @click.option("--save-as", default=None, help="If set, replace the project with the result instead of just printing it.")
-def search_cmd(query_file, method, kmer_k, top_n, min_score, name, name_regex, tag, seq_type, min_length, max_length, motif, field, field_min, field_max, field_equals, save_as) -> None:
+def search_cmd(query_file, method, kmer_k, top_n, min_score, db_path, program, export_path, name, name_regex, tag, seq_type, min_length, max_length, motif, field, field_min, field_max, field_equals, save_as) -> None:
     """Search the current project.
 
     With no QUERY_FILE: metadata/tag/motif filtering (spec section 7).
-    With QUERY_FILE: similarity search against the project (spec section 8),
-    then optionally narrowed further by the same filter options.
+    With QUERY_FILE: similarity search (spec section 8) -- against the
+    project by default, or against an existing DB with --db (e.g. a
+    downloaded UniRef/nr/PDB DB; see `bio db fetch`). Filter options apply
+    only to hits resolvable in the current project; --db hits from outside
+    the project are shown/exported as bare id+score pairs.
     """
     collection = project.load_collection()
 
-    if query_file is not None:
-        query_records = bio_io.read_file(query_file)
-        if not query_records:
-            raise click.ClickException(f"no sequences found in {query_file}")
-        query_seq = query_records[0].sequence
-        if len(query_records) > 1:
-            click.echo(f"note: {query_file} has {len(query_records)} sequences; using the first ('{query_records[0].name}') as query", err=True)
-        try:
-            hits = search_similar(collection, query_seq, method=method, k=kmer_k, top_n=top_n, min_score=min_score)
-        except RuntimeError as e:
-            raise click.ClickException(str(e))
-        result = BioCollection()
-        for hit in hits:
-            hit.record.set("similarity_score", round(hit.score, 4))
-            if hit.record.seq_id not in result:
-                result.add(hit.record)
-        result = run_filters(
-            result, name=name, name_regex=name_regex, tag=tag, seq_type=seq_type,
-            min_length=min_length, max_length=max_length, motif=motif,
-            field=field, field_min=field_min, field_max=field_max, field_equals=field_equals,
-        )
-        ordered = sorted(result, key=lambda r: -r.get("similarity_score", 0.0))
-        for rec in ordered:
-            click.echo(f"{rec.seq_id}\t{rec.name}\t{rec.seq_type.value}\t{rec.length}\tscore={rec.get('similarity_score')}")
-        click.echo(f"-- {len(ordered)} hit(s) (method={method})", err=True)
-    else:
+    if query_file is None:
         result = run_filters(
             collection, name=name, name_regex=name_regex, tag=tag, seq_type=seq_type,
             min_length=min_length, max_length=max_length, motif=motif,
@@ -189,6 +171,74 @@ def search_cmd(query_file, method, kmer_k, top_n, min_score, name, name_regex, t
         for rec in result:
             click.echo(f"{rec.seq_id}\t{rec.name}\t{rec.seq_type.value}\t{rec.length}")
         click.echo(f"-- {len(result)}/{len(collection)} record(s) matched", err=True)
+        if save_as == "project":
+            project.save_collection(result)
+            project.log_command()
+            click.echo("project replaced with search result", err=True)
+        return
+
+    query_records = bio_io.read_file(query_file)
+    if not query_records:
+        raise click.ClickException(f"no sequences found in {query_file}")
+    query_seq = query_records[0].sequence
+    if len(query_records) > 1:
+        click.echo(f"note: {query_file} has {len(query_records)} sequences; using the first ('{query_records[0].name}') as query", err=True)
+
+    try:
+        hits = search_similar(
+            collection, query_seq, method=method, k=kmer_k, top_n=top_n, min_score=min_score,
+            db_path=db_path, program=program,
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e))
+
+    in_project = [h for h in hits if h.record is not None]
+    external = [h for h in hits if h.record is None]
+
+    if db_path is not None:
+        # Searching an external DB: hits generally won't resolve to project
+        # records, so skip the metadata-filter path entirely and just show
+        # id+score (the project-filter options don't mean anything here).
+        ordered = sorted(hits, key=lambda h: -h.score)
+        for hit in ordered:
+            tag_note = "" if hit.record is None else "\t(in project)"
+            click.echo(f"{hit.hit_id}\tscore={hit.score:.4f}{tag_note}")
+        click.echo(f"-- {len(ordered)} hit(s) (method={method}, db={db_path})", err=True)
+        if export_path is not None:
+            import csv as csv_mod
+            with open(export_path, "w", newline="") as fh:
+                writer = csv_mod.writer(fh)
+                writer.writerow(["hit_id", "score", "in_project"])
+                for hit in ordered:
+                    writer.writerow([hit.hit_id, hit.score, hit.record is not None])
+            click.echo(f"exported hits to {export_path}", err=True)
+        return
+
+    result = BioCollection()
+    for hit in in_project:
+        hit.record.set("similarity_score", round(hit.score, 4))
+        if hit.record.seq_id not in result:
+            result.add(hit.record)
+    result = run_filters(
+        result, name=name, name_regex=name_regex, tag=tag, seq_type=seq_type,
+        min_length=min_length, max_length=max_length, motif=motif,
+        field=field, field_min=field_min, field_max=field_max, field_equals=field_equals,
+    )
+    ordered = sorted(result, key=lambda r: -r.get("similarity_score", 0.0))
+    for rec in ordered:
+        click.echo(f"{rec.seq_id}\t{rec.name}\t{rec.seq_type.value}\t{rec.length}\tscore={rec.get('similarity_score')}")
+    click.echo(f"-- {len(ordered)} hit(s) (method={method})", err=True)
+    if external:
+        click.echo(f"-- (also {len(external)} hit(s) outside the project, not shown -- pass --db explicitly to search a DB and see raw hits)", err=True)
+
+    if export_path is not None:
+        import csv as csv_mod
+        with open(export_path, "w", newline="") as fh:
+            writer = csv_mod.writer(fh)
+            writer.writerow(["seq_id", "name", "score"])
+            for rec in ordered:
+                writer.writerow([rec.seq_id, rec.name, rec.get("similarity_score")])
+        click.echo(f"exported hits to {export_path}", err=True)
 
     if save_as == "project":
         project.save_collection(result)
@@ -752,6 +802,42 @@ def embed_cmd(embed_method, kmer_k, model_name, reduce_method, n_components, seq
         click.echo(f"saved sequence space plot to {plot_output}")
 
     project.log_command()
+
+
+@main.group("db")
+def db_group() -> None:
+    """Download public sequence databases for `bio search --db` (spec
+    section 8's high-precision similarity search against a real DB,
+    rather than just the current project)."""
+
+
+@db_group.command("fetch")
+@click.argument("name")
+@click.option("--tool", required=True, type=click.Choice(["blast", "mmseqs"]), help="Which downloader to use.")
+@click.option("--output", "output_path", type=click.Path(path_type=Path), required=True, help="Output DB prefix/directory.")
+def db_fetch_cmd(name, tool, output_path) -> None:
+    """Download a public DB (e.g. `bio db fetch nr --tool blast --output
+    ./blastdb/nr`, or `bio db fetch UniRef50 --tool mmseqs --output
+    ./mmseqs_db/uniref50`). See `bio db list` for common names; each
+    tool's full catalog is larger and changes over time."""
+    try:
+        result_path = bio_db.fetch_db(tool, name, output_path)
+    except RuntimeError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"downloaded {name} ({tool}) -> {result_path}")
+    click.echo(f"use it with: bio search QUERY --method {'blast' if tool == 'blast' else 'mmseqs'} --db {result_path}")
+
+
+@db_group.command("list")
+def db_list_cmd() -> None:
+    """Show a few commonly-used DB names for each downloader."""
+    click.echo("blast (via update_blastdb.pl):")
+    for name in bio_db.COMMON_BLAST_DBS:
+        click.echo(f"  {name}")
+    click.echo("mmseqs (via `mmseqs databases`):")
+    for name in bio_db.COMMON_MMSEQS_DBS:
+        click.echo(f"  {name}")
+    click.echo("(not exhaustive -- run `update_blastdb.pl --showall` or `mmseqs databases` with no args for the full catalog)")
 
 
 if __name__ == "__main__":

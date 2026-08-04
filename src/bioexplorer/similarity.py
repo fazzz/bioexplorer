@@ -85,8 +85,13 @@ def minhash_similarity(sig_a: tuple[int, ...], sig_b: tuple[int, ...]) -> float:
 
 @dataclass
 class SimilarityHit:
-    record: BioRecord
+    record: BioRecord | None
     score: float
+    hit_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.hit_id:
+            self.hit_id = self.record.name if self.record is not None else ""
 
 
 def search_fast(
@@ -147,28 +152,42 @@ def search_blast(
     program: str = "blastn",
     top_n: int = 10,
     evalue: float = 10.0,
+    db_path: str | Path | None = None,
 ) -> list[SimilarityHit]:
+    """Search either an ephemeral DB built from `collection` (default) or
+    an existing prebuilt BLAST DB given by `db_path` (e.g. downloaded via
+    `bio db fetch --tool blast`, or any DB you built yourself with
+    makeblastdb -- pass the DB prefix, not a file with an extension).
+    Hits whose sseqid isn't in `collection` (always true for an external
+    DB) come back with record=None and hit_id set to the raw sseqid."""
     _require_tool(program)
-    _require_tool("makeblastdb")
-    dbtype = "nucl" if program == "blastn" else "prot"
+    by_name: dict[str, BioRecord] = {}
+    for rec in collection:
+        by_name.setdefault(rec.name, rec)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db_fasta = tmp_path / "db.fasta"
         query_fasta = tmp_path / "query.fasta"
-        write_fasta(collection, db_fasta)
         query_fasta.write_text(f">query\n{query_sequence}\n")
 
-        subprocess.run(
-            ["makeblastdb", "-in", str(db_fasta), "-dbtype", dbtype, "-out", str(tmp_path / "db")],
-            check=True,
-            capture_output=True,
-        )
+        if db_path is not None:
+            resolved_db = str(db_path)
+        else:
+            _require_tool("makeblastdb")
+            dbtype = "nucl" if program == "blastn" else "prot"
+            db_fasta = tmp_path / "db.fasta"
+            write_fasta(collection, db_fasta)
+            subprocess.run(
+                ["makeblastdb", "-in", str(db_fasta), "-dbtype", dbtype, "-out", str(tmp_path / "db")],
+                check=True, capture_output=True,
+            )
+            resolved_db = str(tmp_path / "db")
+
         result = subprocess.run(
             [
                 program,
                 "-query", str(query_fasta),
-                "-db", str(tmp_path / "db"),
+                "-db", resolved_db,
                 "-outfmt", "6 sseqid bitscore pident",
                 "-evalue", str(evalue),
                 "-max_target_seqs", str(top_n),
@@ -178,40 +197,47 @@ def search_blast(
             text=True,
         )
 
-    by_name: dict[str, BioRecord] = {}
-    for rec in collection:
-        by_name.setdefault(rec.name, rec)
-
     hits = []
     for line in result.stdout.strip().splitlines():
         sseqid, bitscore, pident = line.split("\t")
         rec = by_name.get(sseqid)
-        if rec is not None:
-            hits.append(SimilarityHit(rec, float(pident) / 100.0))
+        hits.append(SimilarityHit(rec, float(pident) / 100.0, hit_id=sseqid))
     return hits[:top_n]
 
 
 def search_diamond(
-    collection: BioCollection, query_sequence: str, top_n: int = 10
+    collection: BioCollection,
+    query_sequence: str,
+    top_n: int = 10,
+    db_path: str | Path | None = None,
 ) -> list[SimilarityHit]:
+    """Search either an ephemeral DB built from `collection` (default) or
+    an existing prebuilt DIAMOND DB given by `db_path` (a .dmnd file, e.g.
+    built with `diamond makedb --in uniprot_sprot.fasta -d sprot`)."""
     _require_tool("diamond")
+    by_name = {rec.name: rec for rec in collection}
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db_fasta = tmp_path / "db.fasta"
         query_fasta = tmp_path / "query.fasta"
-        write_fasta(collection, db_fasta)
         query_fasta.write_text(f">query\n{query_sequence}\n")
 
-        subprocess.run(
-            ["diamond", "makedb", "--in", str(db_fasta), "-d", str(tmp_path / "db")],
-            check=True,
-            capture_output=True,
-        )
+        if db_path is not None:
+            resolved_db = str(db_path)
+        else:
+            db_fasta = tmp_path / "db.fasta"
+            write_fasta(collection, db_fasta)
+            subprocess.run(
+                ["diamond", "makedb", "--in", str(db_fasta), "-d", str(tmp_path / "db")],
+                check=True, capture_output=True,
+            )
+            resolved_db = str(tmp_path / "db")
+
         result = subprocess.run(
             [
                 "diamond", "blastp",
                 "-q", str(query_fasta),
-                "-d", str(tmp_path / "db"),
+                "-d", resolved_db,
                 "-k", str(top_n),
                 "--outfmt", "6", "sseqid", "pident",
             ],
@@ -220,31 +246,42 @@ def search_diamond(
             text=True,
         )
 
-    by_name = {rec.name: rec for rec in collection}
     hits = []
     for line in result.stdout.strip().splitlines():
         sseqid, pident = line.split("\t")
         rec = by_name.get(sseqid)
-        if rec is not None:
-            hits.append(SimilarityHit(rec, float(pident) / 100.0))
+        hits.append(SimilarityHit(rec, float(pident) / 100.0, hit_id=sseqid))
     return hits[:top_n]
 
 
 def search_mmseqs(
-    collection: BioCollection, query_sequence: str, top_n: int = 10
+    collection: BioCollection,
+    query_sequence: str,
+    top_n: int = 10,
+    db_path: str | Path | None = None,
 ) -> list[SimilarityHit]:
+    """Search either an ephemeral DB built from `collection` (default) or
+    an existing prebuilt MMseqs2 target DB given by `db_path` (a DB
+    prefix, e.g. from `bio db fetch --tool mmseqs --name UniRef50`)."""
     _require_tool("mmseqs")
+    by_name = {rec.name: rec for rec in collection}
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db_fasta = tmp_path / "db.fasta"
         query_fasta = tmp_path / "query.fasta"
-        write_fasta(collection, db_fasta)
         query_fasta.write_text(f">query\n{query_sequence}\n")
 
-        subprocess.run(
-            ["mmseqs", "createdb", str(db_fasta), str(tmp_path / "targetDB")],
-            check=True, capture_output=True,
-        )
+        if db_path is not None:
+            target_db = str(db_path)
+        else:
+            db_fasta = tmp_path / "db.fasta"
+            write_fasta(collection, db_fasta)
+            subprocess.run(
+                ["mmseqs", "createdb", str(db_fasta), str(tmp_path / "targetDB")],
+                check=True, capture_output=True,
+            )
+            target_db = str(tmp_path / "targetDB")
+
         subprocess.run(
             ["mmseqs", "createdb", str(query_fasta), str(tmp_path / "queryDB")],
             check=True, capture_output=True,
@@ -252,7 +289,7 @@ def search_mmseqs(
         subprocess.run(
             [
                 "mmseqs", "search",
-                str(tmp_path / "queryDB"), str(tmp_path / "targetDB"),
+                str(tmp_path / "queryDB"), target_db,
                 str(tmp_path / "resultDB"), str(tmp_path / "tmp"),
             ],
             check=True, capture_output=True,
@@ -260,7 +297,7 @@ def search_mmseqs(
         subprocess.run(
             [
                 "mmseqs", "convertalis",
-                str(tmp_path / "queryDB"), str(tmp_path / "targetDB"),
+                str(tmp_path / "queryDB"), target_db,
                 str(tmp_path / "resultDB"), str(tmp_path / "result.tsv"),
                 "--format-output", "target,pident",
             ],
@@ -268,13 +305,11 @@ def search_mmseqs(
         )
         result_text = (tmp_path / "result.tsv").read_text()
 
-    by_name = {rec.name: rec for rec in collection}
     hits = []
     for line in result_text.strip().splitlines():
         target, pident = line.split("\t")
         rec = by_name.get(target)
-        if rec is not None:
-            hits.append(SimilarityHit(rec, float(pident) / 100.0))
+        hits.append(SimilarityHit(rec, float(pident) / 100.0, hit_id=target))
     return hits[:top_n]
 
 
@@ -288,14 +323,19 @@ def search_similar(
     k: int | None = None,
     top_n: int = 10,
     min_score: float = 0.0,
+    db_path: str | Path | None = None,
+    program: str = "blastn",
 ) -> list[SimilarityHit]:
-    """Dispatch to the requested similarity method."""
+    """Dispatch to the requested similarity method. `db_path` (blast:
+    a makeblastdb prefix; diamond: a .dmnd file; mmseqs: an mmseqs DB
+    prefix) is ignored for kmer/minhash, which always search the current
+    project's collection."""
     if method in ("kmer", "minhash"):
         return search_fast(collection, query_sequence, method=method, k=k, top_n=top_n, min_score=min_score)
     if method == "blast":
-        return search_blast(collection, query_sequence, top_n=top_n)
+        return search_blast(collection, query_sequence, program=program, top_n=top_n, db_path=db_path)
     if method == "diamond":
-        return search_diamond(collection, query_sequence, top_n=top_n)
+        return search_diamond(collection, query_sequence, top_n=top_n, db_path=db_path)
     if method == "mmseqs":
-        return search_mmseqs(collection, query_sequence, top_n=top_n)
+        return search_mmseqs(collection, query_sequence, top_n=top_n, db_path=db_path)
     raise ValueError(f"unknown similarity method: {method}")
