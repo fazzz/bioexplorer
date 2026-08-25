@@ -46,6 +46,18 @@ def filter_by_tag(collection: BioCollection, tag: str) -> BioCollection:
     return collection.filter(lambda r: r.has_tag(tag))
 
 
+def filter_by_tag_absent(collection: BioCollection, tag: str) -> BioCollection:
+    """Exclude records that have this tag -- the presence-based analogue
+    of a '!=' condition, since tags are flags rather than key=value pairs."""
+    return collection.filter(lambda r: not r.has_tag(tag))
+
+
+def filter_by_id_exclude(collection: BioCollection, seq_ids: list[str]) -> BioCollection:
+    """ID blacklist: drop records whose seq_id is in the given list."""
+    excluded = set(seq_ids)
+    return collection.filter(lambda r: r.seq_id not in excluded)
+
+
 def filter_by_seq_type(collection: BioCollection, seq_type: str) -> BioCollection:
     return collection.filter(lambda r: r.seq_type.value == seq_type)
 
@@ -76,6 +88,19 @@ def filter_by_motif(
     return collection.filter(lambda r: needle in r.sequence)
 
 
+def filter_by_motif_absent(
+    collection: BioCollection, pattern: str, regex: bool = True
+) -> BioCollection:
+    """Exclude records whose sequence matches this motif -- e.g. drop
+    anything hitting a known problem pattern, the sequence-motif analogue
+    of ChemExplorer's --exclude-smarts structural-alert filter."""
+    if regex:
+        rx = re.compile(pattern.upper())
+        return collection.filter(lambda r: rx.search(r.sequence) is None)
+    needle = pattern.upper()
+    return collection.filter(lambda r: needle not in r.sequence)
+
+
 def filter_by_metadata_range(
     collection: BioCollection,
     dotted_key: str,
@@ -104,19 +129,31 @@ def filter_by_metadata_equals(
     return collection.filter(lambda r: str(_get_nested(r, dotted_key)) == expected)
 
 
+def filter_by_metadata_not_equals(
+    collection: BioCollection, dotted_key: str, excluded: str
+) -> BioCollection:
+    """'!=' exclusion on a metadata field, e.g. ``descriptor.seq_type!=protein``.
+    A record with no value at all for the field counts as not-equal (passes)."""
+    return collection.filter(lambda r: str(_get_nested(r, dotted_key)) != excluded)
+
+
 def run_filters(
     collection: BioCollection,
     name: str | None = None,
     name_regex: bool = False,
     tag: str | None = None,
+    exclude_tag: str | None = None,
     seq_type: str | None = None,
     min_length: int | None = None,
     max_length: int | None = None,
     motif: str | None = None,
+    exclude_motif: str | None = None,
     field: str | None = None,
     field_min: float | None = None,
     field_max: float | None = None,
     field_equals: str | None = None,
+    field_not_equals: str | None = None,
+    exclude_ids: list[str] | None = None,
 ) -> BioCollection:
     """Apply whichever filters were given, in a fixed, cheap-first order."""
     result = collection
@@ -126,12 +163,20 @@ def run_filters(
         result = filter_by_name(result, name, regex=name_regex)
     if tag:
         result = filter_by_tag(result, tag)
+    if exclude_tag:
+        result = filter_by_tag_absent(result, exclude_tag)
     if min_length is not None or max_length is not None:
         result = filter_by_length(result, min_length, max_length)
     if motif:
         result = filter_by_motif(result, motif)
+    if exclude_motif:
+        result = filter_by_motif_absent(result, exclude_motif)
     if field and (field_min is not None or field_max is not None):
         result = filter_by_metadata_range(result, field, field_min, field_max)
     if field and field_equals is not None:
         result = filter_by_metadata_equals(result, field, field_equals)
+    if field and field_not_equals is not None:
+        result = filter_by_metadata_not_equals(result, field, field_not_equals)
+    if exclude_ids:
+        result = filter_by_id_exclude(result, exclude_ids)
     return result

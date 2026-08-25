@@ -52,6 +52,7 @@ def save_collection(collection: BioCollection, cwd: Path | None = None) -> None:
                 "description": rec.description,
                 "tags": sorted(rec.tags),
                 "metadata": rec.metadata,
+                "quality": rec.quality,
             }
         )
     with open(_state_path(cwd), "w") as fh:
@@ -77,6 +78,7 @@ def load_collection(cwd: Path | None = None) -> BioCollection:
             description=row.get("description", ""),
             tags=set(row.get("tags", [])),
             metadata=row.get("metadata", {}),
+            quality=row.get("quality"),
         )
         collection.add(rec)
     return collection

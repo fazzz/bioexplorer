@@ -171,3 +171,17 @@ def tree_summary(tree) -> dict:
         "max_depth": max(depths.values()) if depths else 0.0,
         "taxa": [t.name for t in terminals],
     }
+
+
+def prune_tree_to_names(tree, keep_names: set[str]):
+    """Restrict a tree to the given leaf names, in place (pass a fresh
+    tree -- e.g. straight from read_newick/load_tree -- if the original
+    shouldn't be touched). Not in the spec: the tree-shaped counterpart of
+    the shared --tag/--field selection vocabulary, so `bio plot tree` can
+    show a subtree without rebuilding the whole tree."""
+    to_remove = [t for t in tree.get_terminals() if t.name not in keep_names]
+    if len(to_remove) >= len(tree.get_terminals()):
+        raise ValueError("selection matches none of the tree's taxa")
+    for terminal in to_remove:
+        tree.prune(terminal)
+    return tree

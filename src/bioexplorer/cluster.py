@@ -7,6 +7,14 @@ Methods:
   existing cluster whose seed is similar enough, else start a new cluster),
   using the k-mer/MinHash similarity from similarity.py as the identity
   proxy. No external tool required.
+- ``hierarchical``: agglomerative clustering (scipy) over a k-mer/MinHash
+  distance matrix, cut either by a distance threshold or a target cluster
+  count. No external binary required, but does need the ``cluster`` extra
+  (scipy) -- a middle ground between ``greedy`` (dependency-free, but a
+  simple incremental heuristic) and ``cdhit``/``mmseqs`` (external binary,
+  but exact sequence identity). Not in the original spec -- ported from
+  ChemExplorer/ProteinExplorer, which both offer this option and BioExplorer
+  didn't.
 - ``cdhit``: the real CD-HIT / CD-HIT-EST binary (exact sequence identity
   via its own greedy+alignment algorithm), via subprocess.
 - ``mmseqs``: MMseqs2's ``easy-cluster``, via subprocess.
@@ -86,6 +94,89 @@ def cluster_greedy(
                 break
         if not joined:
             clusters.append(Cluster(cluster_id=len(clusters), members=[rec], representative=rec))
+    return clusters
+
+
+# -- in-process hierarchical clustering (scipy) ------------------------------
+
+_HIERARCHICAL_LINKAGE_METHODS = ("single", "complete", "average", "weighted")
+
+
+def _distance_matrix(records: list[BioRecord], method: str, k: int):
+    import numpy as np
+
+    n = len(records)
+    dist = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = 1.0 - _fast_similarity(records[i].sequence, records[j].sequence, method, k)
+            dist[i, j] = dist[j, i] = d
+    return dist
+
+
+def cluster_hierarchical(
+    records: list[BioRecord],
+    method: str = "kmer",
+    k: int | None = None,
+    linkage_method: str = "average",
+    distance_threshold: float | None = None,
+    n_clusters: int | None = None,
+) -> list[Cluster]:
+    """Agglomerative clustering (scipy) over a k-mer/MinHash distance
+    matrix (distance = 1 - similarity). No external binary required, but
+    does need scipy (the ``cluster`` extra) -- a middle ground between
+    ``greedy`` (dependency-free heuristic) and ``cdhit``/``mmseqs``
+    (external binary, exact identity).
+
+    Cut the dendrogram either by ``distance_threshold`` (merge stops once
+    the nearest pair is farther apart than this) or by ``n_clusters``
+    (cut to get exactly this many groups) -- give exactly one. Defaults to
+    ``distance_threshold=0.3`` if neither is given.
+
+    ``linkage_method`` intentionally excludes 'ward': Ward's method
+    assumes a Euclidean metric and gives misleading merges on an arbitrary
+    precomputed (1 - similarity) distance like this one.
+    """
+    if not records:
+        return []
+    if len(records) == 1:
+        return [Cluster(cluster_id=0, members=list(records), representative=records[0])]
+    if distance_threshold is not None and n_clusters is not None:
+        raise ValueError("give either distance_threshold or n_clusters, not both")
+    if distance_threshold is None and n_clusters is None:
+        distance_threshold = 0.3
+    if linkage_method not in _HIERARCHICAL_LINKAGE_METHODS:
+        raise ValueError(f"unknown linkage method: {linkage_method} (choose from {_HIERARCHICAL_LINKAGE_METHODS})")
+    if n_clusters is not None and not (1 <= n_clusters <= len(records)):
+        raise ValueError(f"n_clusters must be between 1 and {len(records)}, got {n_clusters}")
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage as scipy_linkage
+        from scipy.spatial.distance import squareform
+    except ImportError as e:
+        raise RuntimeError(
+            "hierarchical clustering requires scipy "
+            "(uv sync --extra cluster, or pip install -e '.[cluster]')"
+        ) from e
+
+    kk = k or (4 if method == "kmer" else 9)
+    dist_matrix = _distance_matrix(records, method, kk)
+    condensed = squareform(dist_matrix, checks=False)
+    z = scipy_linkage(condensed, method=linkage_method)
+
+    if n_clusters is not None:
+        labels = fcluster(z, t=n_clusters, criterion="maxclust")
+    else:
+        labels = fcluster(z, t=distance_threshold, criterion="distance")
+
+    groups: dict[int, list[BioRecord]] = {}
+    for rec, label in zip(records, labels):
+        groups.setdefault(int(label), []).append(rec)
+
+    clusters = []
+    for i, (_, members) in enumerate(sorted(groups.items())):
+        representative = max(members, key=lambda r: r.length)
+        clusters.append(Cluster(cluster_id=i, members=members, representative=representative))
     return clusters
 
 

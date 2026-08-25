@@ -82,11 +82,20 @@ class BioRecord:
     description: str = ""
     tags: set[str] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
+    quality: list[int] | None = None
+    """Per-base Phred quality scores (FASTQ imports only), same length as
+    ``sequence``. None for formats without quality data (FASTA, GenBank, ...).
+    """
 
     def __post_init__(self) -> None:
         self.sequence = self.sequence.upper()
         if isinstance(self.seq_type, str):
             self.seq_type = SeqType(self.seq_type)
+        if self.quality is not None and len(self.quality) != len(self.sequence):
+            raise ValueError(
+                f"quality has {len(self.quality)} value(s) but sequence has "
+                f"{len(self.sequence)} base(s) -- they must be the same length"
+            )
 
     # -- convenience -----------------------------------------------------
 
@@ -118,6 +127,8 @@ class BioRecord:
         rec.annotations["bioexplorer_seq_id"] = self.seq_id
         rec.annotations["bioexplorer_seq_type"] = self.seq_type.value
         rec.annotations["bioexplorer_tags"] = sorted(self.tags)
+        if self.quality is not None:
+            rec.letter_annotations["phred_quality"] = list(self.quality)
         return rec
 
     @classmethod
@@ -130,6 +141,7 @@ class BioRecord:
         )
         tags = set(rec.annotations.get("bioexplorer_tags", []))
         seq_id = rec.annotations.get("bioexplorer_seq_id") or _new_id()
+        quality = rec.letter_annotations.get("phred_quality")
         return cls(
             name=rec.id,
             sequence=sequence,
@@ -137,6 +149,7 @@ class BioRecord:
             seq_id=seq_id,
             description=rec.description,
             tags=tags,
+            quality=list(quality) if quality is not None else None,
         )
 
 

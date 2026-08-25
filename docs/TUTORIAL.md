@@ -29,8 +29,9 @@ uv run bio --help
 uv sync --extra cluster   # scipy, scikit-learn -> クラスタリングの一部内部計算、bio embed --reduce pca/tsne
 uv sync --extra embed     # umap-learn -> bio embed --reduce umap
 uv sync --extra viz       # matplotlib, cairosvg -> bio plot / bio logo / bio profile --plot
+uv sync --extra parquet   # pandas, pyarrow -> bio export ....parquet
 # 複数同時指定も可能
-uv sync --extra cluster --extra embed --extra viz
+uv sync --extra cluster --extra embed --extra viz --extra parquet
 ```
 
 ### 1.3 外部ツール(バイナリ)一覧
@@ -245,6 +246,20 @@ cluster sizes: [4, 3]
 
 (`consensus_len=... (approx)`となっているのは、このクラスタ内で配列長が揃っていない=インデル差があるため、MSAツール未導入時はrepresentative配列を近似値として使っているからです。MAFFT等があれば厳密なconsensusが計算されます。)
 
+**`hierarchical`(仕様書外、ChemExplorer/ProteinExploerer対応)**: `greedy`(依存なしの貪欲法)と`cdhit`/`mmseqs`(外部バイナリ、正確な配列同一性)の中間として、scipyベースの凝集型クラスタリングも用意しています。外部バイナリ不要、`uv sync --extra cluster`だけで使えます:
+
+```bash
+$ bio cluster --method hierarchical --n-clusters 2
+7 record(s) -> 2 cluster(s) (method=hierarchical)
+cluster sizes: [4, 3]
+  cluster 0: n=3 rep=AF191665.1 centroid=AF191664.1 consensus_len=156 (approx)
+  cluster 1: n=4 rep=AF191658.1 centroid=AF191661.1 consensus_len=148 (approx)
+
+$ bio cluster --method hierarchical --linkage complete --distance-threshold 0.15
+```
+
+`--n-clusters`(欲しいクラスタ数を指定)と`--distance-threshold`(距離がこれを超えたら併合を止める、デフォルト0.3)はどちらか一方だけ指定してください。`--linkage`は`single`/`complete`/`average`/`weighted`から選べます(`ward`は今回のような事前計算済み距離行列とは相性が悪いため意図的に除外しています)。
+
 ### 3.7 tree(NJ + bootstrap)
 
 ```bash
@@ -349,25 +364,145 @@ bio annotate interpro --email you@example.com
 
 `bio replay`では`annotate`グループもデフォルトで`--skip`対象です(pfam/uniprot/interproがネットワーク・外部DB依存のため、structureのGUI起動と同じ扱い)。
 
-### 3.12 replay
+### 3.12 clean(配列クリーンアップ、仕様書外、ChemExplorer/ProteinExplorer対応)
+
+ChemExplorerの`chem standardize`、ProteinExplorerの`prot fix`に相当する、生データを解析にかける前のクリーンアップコマンドです。重複除去・gap除去・アダプタトリミング・FASTQ品質トリミング・曖昧塩基端トリミング・長さ/曖昧度フィルタを組み合わせて使えます。デフォルトではプロジェクトに直接書き戻すので、まず`--dry-run`で件数を確認するのがおすすめです。
+
+```bash
+$ bio import examples/opuntia/opuntia_raw.fasta
+$ bio clean --dedup-sequence --dry-run
+7 record(s) selected -> 7 kept
+(dry run -- project not modified)
+```
+
+**FASTQ品質トリミング**の例(実際に動かした結果):
+
+```bash
+$ cat reads.fastq
+@read1
+TATACATTAAAGAAGGGGGATGCGGATAAATGGAAAGGCGAAAGAAAGA
++
+!!!!!IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII!!
+
+$ bio import reads.fastq --format fastq
+$ bio clean --min-quality 20 --quality-window 3
+1 record(s) selected -> 1 kept
+  quality-trimmed: 1
+project updated: 1 record(s) total
+```
+
+先頭5塩基(`!`=Phred 0)と末尾2塩基が正しくトリムされ、配列と品質値の長さが常に一致していることも確認済みです。FASTQの品質値は`bio import`時に保持され、プロジェクト状態にも永続化されます(以前は破棄されていましたが、`bio clean`の実装に合わせて修正しました)。
+
+他の主なオプション:
+
+```bash
+bio clean --strip-gaps                              # 誤ってgap付きで取り込んだ配列からgapを除去
+bio clean --trim-ambiguous-ends                      # 先頭・末尾のN/曖昧塩基(proteinはX)を除去
+bio clean --max-ambiguous-fraction 0.1                # 曖昧塩基が10%を超える配列を除外
+bio clean --adapter AGATCGGAAGAGC --adapter-end 3     # 3'側のアダプタ配列を除去(完全一致)
+bio clean --result-min-length 50 --result-max-length 500  # トリミング後の長さで除外
+```
+
+`--min-length`/`--max-length`(絞り込み対象を選ぶ、`bio search`と共通の語彙)と、`--result-min-length`/`--result-max-length`(トリミング後の結果を長さで落とす、cleanコマンド自身のオプション)は別物なので注意してください。前者は「どの配列を掃除するか」、後者は「掃除した後に短すぎる/長すぎるものを捨てるか」を制御します。
+
+対象範囲は他のコマンドと同じ非破壊selection語彙(`--tag`/`--type`/`--field`等)で絞り込めます。選択されなかった配列はそのまま残ります:
+
+```bash
+bio clean --strip-gaps --tag needs_cleanup   # needs_cleanupタグの付いた配列だけ処理
+```
+
+### 3.13 仕上げ機能(仕様書外、ChemExplorer対応)
+
+仕様書には無いが実用上効く4つの機能を追加しています。実データ(Opuntia、`bio cluster --save-as project`まで実行済みとする)で確認します。
+
+**(1) `!=`除外条件**:
+
+```bash
+$ bio search --field descriptor.gc_percent --field-equals 25.0
+-- 1/7 record(s) matched
+$ bio search --field descriptor.gc_percent --field-not-equals 25.0
+-- 6/7 record(s) matched   # 1件除外されてちょうど逆になる
+```
+
+タグには値がないので、`!=`に相当するのは`--exclude-tag`(そのタグを持たないものだけ残す):
+
+```bash
+$ bio search --exclude-tag cluster_centroid
+-- 5/7 record(s) matched   # centroidタグの2件を除外
+```
+
+**(2) motif除外・IDブラックリスト**:
+
+```bash
+$ bio search --exclude-motif "CTAATAAATTAGATGAATAT"
+-- 0/7 record(s) matched   # 全配列に共通の高保存領域なので、除外すると0件になる
+$ bio search --exclude-id <seq_id>
+-- 6/7 record(s) matched
+```
+
+**(3) 出力系コマンドへの非破壊selection**: `bio export`/`bio align`/`bio profile`/`bio logo`/`bio tree`/`bio plot`/`bio cluster`/`bio embed`/`bio dnds`が`bio search`と同じ語彙(`--tag`/`--type`/`--field`/`--motif`/`--exclude-*`)を非破壊で受け付けます。プロジェクトは変更されないので、条件を変えるたびに再importする必要がありません:
+
+```bash
+$ bio export cluster0_only.fasta --tag cluster_0
+exported 4/7 record(s) to cluster0_only.fasta (fasta)
+$ bio status   # プロジェクトは7件のまま変わらない
+records: 7
+
+$ bio profile --tag cluster_0       # 4配列分だけのプロファイル
+4 sequences x 156 positions (dna)
+mean conservation score: 0.3798
+$ bio profile --exclude-tag cluster_0   # 残り3配列分
+3 sequences x 156 positions (dna)
+mean conservation score: 0.2971
+$ bio profile                            # 全7配列(比較用)
+7 sequences x 156 positions (dna)
+mean conservation score: 0.5109
+
+$ bio tree --tag cluster_0 --save-as cluster0_tree    # 4taxaの部分木
+built nj tree: 4 taxa, 2 internal nodes
+$ bio plot tree --tree-name full_tree --tag cluster_1 --output pruned.png  # 保存済みの全体木を後からprune
+```
+
+アラインメント由来のコマンド(`bio profile`/`bio logo`/`bio tree`/`bio plot alignment`)はアラインメントファイル自体にタグ・メタデータが無いため、プロジェクト内の同名レコードと突き合わせてタグを補完してからフィルタします。`bio plot tree`はNewick木そのものにタグが無いので、プロジェクトと名前で突き合わせて該当しないtaxaを`Bio.Phylo`の`prune`で落とします。
+
+**(4) `bio report`(任意次元クロス集計)**:
+
+```bash
+$ bio report --by type --by tag_prefix:cluster_
+type    tag_prefix:cluster_       count
+dna     0                         3
+dna     0,centroid,representative 1
+dna     1                         1
+dna     1,centroid                1
+dna     1,representative          1
+-- 5 combination(s) over 7 record(s)
+
+$ bio report --by tag_prefix:cluster_ --export report.csv   # CSV出力
+```
+
+`--by`の軸指定は`type`(seq_type)、`tag:<name>`(そのタグの有無、yes/no)、`tag_prefix:<prefix>`(前方一致するタグをカテゴリ化、例: `cluster_0`→`0`)、`field:<dotted.key>`(メタデータの値そのもの)、`field:<dotted.key>:bin<幅>`(数値メタデータを固定幅でビン分け)の5種類。`--by`を複数指定すればN次元クロス集計になります。`bio report`自体も上記の非破壊selectionオプションで集計範囲を絞れます。
+
+### 3.14 replay
 
 ```bash
 $ bio replay --dry-run
 [1] would run: bio import examples/opuntia/opuntia_raw.fasta
 [2] would run: bio descriptor
-[3] would run: bio align --pairwise 1c32b0b3ceeb 1640bf476ee3 --mode global
-...
+[3] would run: bio align --pairwise 7877691521df f70db3ff8da3 --mode global
 
 $ bio replay
-backed up previous project state to .bioexplorer_prereplay_1785795228
+backed up previous project state to .bioexplorer_prereplay_1787478995
 [1] ok: bio import examples/opuntia/opuntia_raw.fasta
 [2] ok: bio descriptor
-[3] FAILED: bio align --pairwise 1c32b0b3ceeb 1640bf476ee3 --mode global
-    Error: seq_id not found in project: '1c32b0b3ceeb'
--- 2 executed, 0 skipped, 1 failed
+[3] ok: bio align --pairwise 011540817805 657536d8c5dc --mode global (id rewritten)
+-- 3 executed, 0 skipped, 0 failed
 ```
 
-**重要な注意点(実際に踏んだ落とし穴です)**: `seq_id`は`bio import`のたびにランダムに再生成されるため、`bio align --pairwise <seq_id> <seq_id>`のように**seq_idを直接指定するコマンドは、そのままでは再現できません**。replayで確実に再現したいワークフローでは、`--name`やタグ、`--type`/`--tag`フィルタなど、名前ベース・条件ベースのオプションを使うようにしてください(例: `bio align --pairwise`の代わりに配列名で対象を絞ってから処理する、など)。この制約はChemExplorer側の分子ID同様、設計上の既知の限界です。
+**`seq_id`の非決定性への対応**: `seq_id`は`bio import`のたびにランダムに再生成されるため、`bio align --pairwise <seq_id> <seq_id>`のように**seq_idを直接指定したコマンド**は、そのままではreplay先のプロジェクトに存在しないIDを参照することになります。上の実行例では、記録時のID(`7877691521df`/`f70db3ff8da3`)がreplay時には`011540817805`/`657536d8c5dc`に変わっていますが、`(id rewritten)`の表示通り自動的に読み替えられて成功しています。
+
+仕組みは、リセット前(=元の実行が残した状態)から「旧ID→配列名」の対応表を作っておき、各ステップを実行する直前に「その配列名の現在のID」に変換してからargvを渡す、というものです。ProteinExplorer側で先に解決されていた同じ問題を移植しました。
+
+これでも救えないケースが2つあります: (1) `--dry-run`はプレビューなので実際には何も実行されず、書き換えも行われません(記録された生のIDがそのまま表示されます)。(2) `--from`で該当する`bio import`ステップ自体をスキップした場合や、レコードが元々存在しない場合は、対応する新IDが見つからないため書き換えられず、そのまま失敗します(想定通りの挙動です)。
 
 ---
 
@@ -407,5 +542,5 @@ backed up previous project state to .bioexplorer_prereplay_1785795228
 
 - **`Error: 'xxx' was not found on PATH`**: 1章の対応表を見て該当ツールを入れてください。入れたくない場合、`--method kmer`/`--method minhash`(類似性検索・埋め込み)、`--method nj`/`--method upgma`(系統樹)など、外部ツール不要な代替手段が大抵用意されています。
 - **`bio profile`/`bio tree`が「アラインメントが必要」と言ってくる**: 配列長が揃っていません。先に`bio align`で整列するか、`--alignment-file`で外部で作った整列済みFASTAを指定してください。
-- **`bio replay`が特定ステップで失敗する**: 上記3.11の通り、seq_id直指定のコマンドは再現性がありません。ログ(`.bioexplorer/log.json`)を見て、該当ステップを`--skip`で除外するか、名前ベースのコマンドに書き換えてから再実行してください。
+- **`bio replay`が特定ステップで失敗する**: seq_id直指定のステップはID自動書き換えで大半は再現できますが、`--from`で該当importをスキップした場合など、対応するレコードが今回のreplayに存在しないと書き換えようがなく失敗します。ログ(`.bioexplorer/log.json`)を見て、該当ステップを`--skip`で除外するか、名前ベースのコマンドに書き換えてから再実行してください。
 - **matplotlib関連のエラー**: `uv sync --extra viz`を実行してください。

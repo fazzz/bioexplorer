@@ -154,7 +154,7 @@ def write_table(collection: BioCollection, path: Path, fmt: str) -> None:
         except ImportError as e:
             raise RuntimeError(
                 "parquet export requires pandas + pyarrow "
-                "(pip install -e '.[export]')"
+                "(uv sync --extra parquet, or pip install -e '.[parquet]')"
             ) from e
         pd.DataFrame(rows).to_parquet(path)
     else:

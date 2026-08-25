@@ -18,10 +18,12 @@ from . import annotate_external
 from . import db as bio_db
 from . import io as bio_io
 from . import project
+from . import report as bio_report
 from . import structure as bio_structure
 from .align import format_alignment, multiple_align, pairwise_align
-from .cluster import annotate_clusters, cluster_cdhit, cluster_greedy, cluster_mmseqs
-from .core import BioCollection
+from .clean import clean_records
+from .cluster import annotate_clusters, cluster_cdhit, cluster_greedy, cluster_hierarchical, cluster_mmseqs
+from .core import BioCollection, BioRecord, SeqType
 from .descriptor import annotate_descriptors
 from .embed import build_sequence_space
 from .evolution import dn_ds_matrix, pairwise_dn_ds
@@ -55,6 +57,95 @@ def _load_alignment(alignment_file: Path | None, name: str) -> list:
     if alignment_file is not None:
         return bio_io.read_file(alignment_file, fmt="fasta")
     return project.load_alignment(name)
+
+
+# -- shared non-destructive selection vocabulary -----------------------------
+#
+# Not in the spec -- ported from ChemExplorer's finishing touches: the same
+# --tag/--field/--motif/--name vocabulary as `bio search`'s filter mode,
+# available on output-producing commands (export/align/profile/tree/plot/
+# embed/dnds/report) so a different slice of the project can be produced
+# without `bio search --save-as project` destructively replacing it (which
+# would mean re-importing to get back to the full set). Includes the
+# exclusion counterparts (--exclude-tag, --exclude-motif, --exclude-id,
+# --field-not-equals) for '!='-style conditions.
+
+_SHARED_FILTER_OPTIONS = [
+    click.option("--name", "sel_name", default=None, help="Substring or (with --name-regex) regex match on name."),
+    click.option("--name-regex", "sel_name_regex", is_flag=True),
+    click.option("--tag", "sel_tag", default=None, help="Require this tag."),
+    click.option("--exclude-tag", "sel_exclude_tag", default=None, help="Exclude records with this tag."),
+    click.option("--type", "sel_seq_type", default=None, type=click.Choice(["dna", "rna", "protein"])),
+    click.option("--min-length", "sel_min_length", type=int, default=None),
+    click.option("--max-length", "sel_max_length", type=int, default=None),
+    click.option("--motif", "sel_motif", default=None, help="Regex sequence motif, e.g. 'N[AG]G'."),
+    click.option("--exclude-motif", "sel_exclude_motif", default=None, help="Exclude records whose sequence matches this regex motif."),
+    click.option("--field", "sel_field", default=None, help="Dotted metadata field, e.g. descriptor.gc_percent or cluster_id."),
+    click.option("--field-min", "sel_field_min", type=float, default=None),
+    click.option("--field-max", "sel_field_max", type=float, default=None),
+    click.option("--field-equals", "sel_field_equals", default=None),
+    click.option("--field-not-equals", "sel_field_not_equals", default=None, help="'!=' exclusion on --field's value."),
+    click.option("--exclude-id", "sel_exclude_ids", multiple=True, help="Exclude this seq_id (repeatable)."),
+]
+
+
+def shared_filter_options(func):
+    """Stack the shared selection options onto a command. Reads back via
+    the ``sel_*`` kwargs Click injects (prefixed to avoid clashing with a
+    command's own same-named options, e.g. `bio align --tag` for restricting
+    multiple-alignment input)."""
+    for opt in reversed(_SHARED_FILTER_OPTIONS):
+        func = opt(func)
+    return func
+
+
+def _apply_shared_filters(collection: BioCollection, **sel) -> BioCollection:
+    return run_filters(
+        collection,
+        name=sel.get("sel_name"),
+        name_regex=sel.get("sel_name_regex", False),
+        tag=sel.get("sel_tag"),
+        exclude_tag=sel.get("sel_exclude_tag"),
+        seq_type=sel.get("sel_seq_type"),
+        min_length=sel.get("sel_min_length"),
+        max_length=sel.get("sel_max_length"),
+        motif=sel.get("sel_motif"),
+        exclude_motif=sel.get("sel_exclude_motif"),
+        field=sel.get("sel_field"),
+        field_min=sel.get("sel_field_min"),
+        field_max=sel.get("sel_field_max"),
+        field_equals=sel.get("sel_field_equals"),
+        field_not_equals=sel.get("sel_field_not_equals"),
+        exclude_ids=list(sel["sel_exclude_ids"]) if sel.get("sel_exclude_ids") else None,
+    )
+
+
+def _enrich_with_project_metadata(records: list, project_collection: BioCollection) -> list:
+    """Records loaded from an alignment/tree file carry only name+sequence
+    (no tags/metadata) -- copy them over from the matching project record
+    (by name) so --tag/--field selection has something to match against.
+    Records with no match in the project keep empty tags/metadata, which
+    just means tag/field filters naturally exclude them."""
+    by_name: dict[str, BioRecord] = {}
+    for rec in project_collection:
+        by_name.setdefault(rec.name, rec)
+    for r in records:
+        match = by_name.get(r.name)
+        if match is not None:
+            r.tags = set(match.tags)
+            r.metadata = dict(match.metadata)
+    return records
+
+
+def _select_alignment_records(records: list, **sel) -> list:
+    """Apply the shared filters to a list of (possibly tag-enriched)
+    alignment records, preserving order."""
+    if not any(v for k, v in sel.items() if k != "sel_name_regex"):
+        return records
+    collection = BioCollection(records)
+    filtered = _apply_shared_filters(collection, **sel)
+    wanted = {r.seq_id for r in filtered}
+    return [r for r in records if r.seq_id in wanted]
 
 
 @main.command("import")
@@ -105,15 +196,19 @@ def status_cmd() -> None:
 @main.command("export")
 @click.argument("output", type=click.Path(path_type=Path))
 @click.option("--format", "fmt", default=None, help="Output format (fasta/csv/tsv/json/parquet); inferred from suffix if omitted.")
-def export_cmd(output: Path, fmt: str | None) -> None:
-    """Export the current project to a file."""
+@shared_filter_options
+def export_cmd(output: Path, fmt: str | None, **sel) -> None:
+    """Export the current project to a file. Accepts the shared selection
+    options (--tag/--field/--motif/... and their --exclude-* counterparts)
+    to export just a slice, without touching the project itself."""
     collection = project.load_collection()
+    selected = _apply_shared_filters(collection, **sel)
     resolved_fmt = fmt or output.suffix.lstrip(".").lower()
     if resolved_fmt in ("fa", "fna", "faa"):
         resolved_fmt = "fasta"
-    bio_io.write_collection(collection, output, resolved_fmt)
+    bio_io.write_collection(selected, output, resolved_fmt)
     project.log_command()
-    click.echo(f"exported {len(collection)} record(s) to {output} ({resolved_fmt})")
+    click.echo(f"exported {len(selected)}/{len(collection)} record(s) to {output} ({resolved_fmt})")
 
 
 @main.command("descriptor")
@@ -143,16 +238,20 @@ def descriptor_cmd(seq_type: str | None) -> None:
 @click.option("--name", default=None, help="Substring or (with --name-regex) regex match on name.")
 @click.option("--name-regex", is_flag=True)
 @click.option("--tag", default=None, help="Require this tag.")
+@click.option("--exclude-tag", default=None, help="Exclude records with this tag.")
 @click.option("--type", "seq_type", default=None, type=click.Choice(["dna", "rna", "protein"]))
 @click.option("--min-length", type=int, default=None)
 @click.option("--max-length", type=int, default=None)
 @click.option("--motif", default=None, help="Regex sequence motif, e.g. 'N[AG]G'.")
+@click.option("--exclude-motif", default=None, help="Exclude records whose sequence matches this regex motif.")
 @click.option("--field", default=None, help="Dotted metadata field, e.g. descriptor.gc_percent or descriptor.pi.")
 @click.option("--field-min", type=float, default=None)
 @click.option("--field-max", type=float, default=None)
 @click.option("--field-equals", default=None)
+@click.option("--field-not-equals", default=None, help="'!=' exclusion on --field's value.")
+@click.option("--exclude-id", "exclude_ids", multiple=True, help="Exclude this seq_id (repeatable).")
 @click.option("--save-as", default=None, help="If set, replace the project with the result instead of just printing it.")
-def search_cmd(query_file, method, kmer_k, top_n, min_score, db_path, program, export_path, name, name_regex, tag, seq_type, min_length, max_length, motif, field, field_min, field_max, field_equals, save_as) -> None:
+def search_cmd(query_file, method, kmer_k, top_n, min_score, db_path, program, export_path, name, name_regex, tag, exclude_tag, seq_type, min_length, max_length, motif, exclude_motif, field, field_min, field_max, field_equals, field_not_equals, exclude_ids, save_as) -> None:
     """Search the current project.
 
     With no QUERY_FILE: metadata/tag/motif filtering (spec section 7).
@@ -163,12 +262,14 @@ def search_cmd(query_file, method, kmer_k, top_n, min_score, db_path, program, e
     the project are shown/exported as bare id+score pairs.
     """
     collection = project.load_collection()
+    exclude_ids = list(exclude_ids) if exclude_ids else None
 
     if query_file is None:
         result = run_filters(
-            collection, name=name, name_regex=name_regex, tag=tag, seq_type=seq_type,
-            min_length=min_length, max_length=max_length, motif=motif,
+            collection, name=name, name_regex=name_regex, tag=tag, exclude_tag=exclude_tag, seq_type=seq_type,
+            min_length=min_length, max_length=max_length, motif=motif, exclude_motif=exclude_motif,
             field=field, field_min=field_min, field_max=field_max, field_equals=field_equals,
+            field_not_equals=field_not_equals, exclude_ids=exclude_ids,
         )
         for rec in result:
             click.echo(f"{rec.seq_id}\t{rec.name}\t{rec.seq_type.value}\t{rec.length}")
@@ -222,9 +323,10 @@ def search_cmd(query_file, method, kmer_k, top_n, min_score, db_path, program, e
         if hit.record.seq_id not in result:
             result.add(hit.record)
     result = run_filters(
-        result, name=name, name_regex=name_regex, tag=tag, seq_type=seq_type,
-        min_length=min_length, max_length=max_length, motif=motif,
+        result, name=name, name_regex=name_regex, tag=tag, exclude_tag=exclude_tag, seq_type=seq_type,
+        min_length=min_length, max_length=max_length, motif=motif, exclude_motif=exclude_motif,
         field=field, field_min=field_min, field_max=field_max, field_equals=field_equals,
+        field_not_equals=field_not_equals, exclude_ids=exclude_ids,
     )
     ordered = sorted(result, key=lambda r: -r.get("similarity_score", 0.0))
     for rec in ordered:
@@ -252,17 +354,18 @@ def search_cmd(query_file, method, kmer_k, top_n, min_score, db_path, program, e
 @click.option("--pairwise", "pairwise_ids", nargs=2, default=None, help="Two seq_ids for pairwise alignment (Needleman-Wunsch/Smith-Waterman).")
 @click.option("--mode", default="global", type=click.Choice(["global", "local"]), help="Pairwise mode: global=Needleman-Wunsch, local=Smith-Waterman.")
 @click.option("--tool", default="mafft", type=click.Choice(["mafft", "muscle", "clustalo"]), help="Multiple alignment tool (used when --pairwise is not given).")
-@click.option("--type", "seq_type", default=None, type=click.Choice(["dna", "rna", "protein"]), help="Restrict multiple alignment to records of this type.")
-@click.option("--tag", default=None, help="Restrict multiple alignment to records with this tag.")
-@click.option("--name", default="default", help="Name to save the multiple alignment under (.bioexplorer/alignments/<name>.fasta).")
-def align_cmd(pairwise_ids, mode, tool, seq_type, tag, name) -> None:
+@click.option("--save-as", "save_name", default="default", help="Name to save the multiple alignment under (.bioexplorer/alignments/<name>.fasta).")
+@shared_filter_options
+def align_cmd(pairwise_ids, mode, tool, save_name, **sel) -> None:
     """Align sequences (spec section 11).
 
     --pairwise ID1 ID2: pairwise alignment between two records in the
     project (no external tool required).
-    Without --pairwise: multiple alignment of the whole project (optionally
-    filtered by --type/--tag) via mafft/muscle/clustalo, saved as a named
-    alignment for later use by `bio profile` / `bio tree`.
+    Without --pairwise: multiple alignment of the whole project via
+    mafft/muscle/clustalo, saved as a named alignment for later use by
+    `bio profile` / `bio tree`. Restrict the input with the shared
+    selection options (--tag/--type/--field/... and their --exclude-*
+    counterparts).
     """
     collection = project.load_collection()
 
@@ -282,12 +385,7 @@ def align_cmd(pairwise_ids, mode, tool, seq_type, tag, name) -> None:
         project.log_command()
         return
 
-    targets = collection
-    if seq_type:
-        targets = targets.filter(lambda r: r.seq_type.value == seq_type)
-    if tag:
-        targets = targets.filter(lambda r: r.has_tag(tag))
-    records = list(targets)
+    records = list(_apply_shared_filters(collection, **sel))
     if len(records) < 2:
         raise click.ClickException(
             f"only {len(records)} record(s) matched the given filters; "
@@ -299,26 +397,32 @@ def align_cmd(pairwise_ids, mode, tool, seq_type, tag, name) -> None:
     except RuntimeError as e:
         raise click.ClickException(str(e))
 
-    path = project.save_alignment(aligned, name=name)
+    path = project.save_alignment(aligned, name=save_name)
     project.log_command()
-    click.echo(f"aligned {len(aligned)} record(s) with {tool}, saved as alignment '{name}' -> {path}")
+    click.echo(f"aligned {len(aligned)} record(s) with {tool}, saved as alignment '{save_name}' -> {path}")
 
 
 @main.command("profile")
 @click.argument("alignment_file", required=False, type=click.Path(exists=True, path_type=Path))
-@click.option("--name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given (from `bio align --name`).")
+@click.option("--alignment-name", "alignment_name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given (from `bio align --save-as`).")
 @click.option("--pseudocount", type=float, default=0.5, help="Pseudocount added to each symbol count before normalizing to probabilities.")
 @click.option("--export", "export_path", type=click.Path(path_type=Path), default=None, help="Write the position-wise profile table (csv/tsv/json) to this path.")
 @click.option("--plot", "plot_kind", default=None, type=click.Choice(["logo", "heatmap", "conservation"]), help="Also render a plot.")
 @click.option("--plot-output", type=click.Path(path_type=Path), default=None, help="Path for --plot output (default: profile_<kind>.png).")
-def profile_cmd(alignment_file, name, pseudocount, export_path, plot_kind, plot_output) -> None:
+@shared_filter_options
+def profile_cmd(alignment_file, alignment_name, pseudocount, export_path, plot_kind, plot_output, **sel) -> None:
     """Compute a sequence profile from an alignment (spec section 10):
     PFM/PPM/PWM/PSSM, consensus sequence, Shannon entropy, conservation
-    score, and relative entropy, per alignment position."""
+    score, and relative entropy, per alignment position. The shared
+    selection options (--tag/--field/... and --exclude-*) restrict the
+    profile to a subset of the alignment (e.g. just one cluster)."""
     try:
-        records = _load_alignment(alignment_file, name)
+        records = _load_alignment(alignment_file, alignment_name)
     except FileNotFoundError as e:
         raise click.ClickException(str(e))
+    records = _select_alignment_records(_enrich_with_project_metadata(records, project.load_collection()), **sel)
+    if len(records) < 1:
+        raise click.ClickException("no alignment records matched the given selection")
 
     profile = build_profile(records, pseudocount=pseudocount)
 
@@ -365,15 +469,20 @@ def profile_cmd(alignment_file, name, pseudocount, export_path, plot_kind, plot_
 
 @main.command("logo")
 @click.argument("alignment_file", required=False, type=click.Path(exists=True, path_type=Path))
-@click.option("--name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given.")
+@click.option("--alignment-name", "alignment_name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given.")
 @click.option("--output", type=click.Path(path_type=Path), default=Path("logo.png"), help="Output image path (.png/.svg/.pdf).")
-def logo_cmd(alignment_file, name, output) -> None:
+@shared_filter_options
+def logo_cmd(alignment_file, alignment_name, output, **sel) -> None:
     """Render a sequence logo from an alignment (shortcut for
-    `bio profile --plot logo`)."""
+    `bio profile --plot logo`). Accepts the shared selection options to
+    render just a subset of the alignment."""
     try:
-        records = _load_alignment(alignment_file, name)
+        records = _load_alignment(alignment_file, alignment_name)
     except FileNotFoundError as e:
         raise click.ClickException(str(e))
+    records = _select_alignment_records(_enrich_with_project_metadata(records, project.load_collection()), **sel)
+    if len(records) < 1:
+        raise click.ClickException("no alignment records matched the given selection")
     profile = build_profile(records)
     from . import viz
     try:
@@ -385,38 +494,42 @@ def logo_cmd(alignment_file, name, output) -> None:
 
 
 @main.command("cluster")
-@click.option("--method", default="greedy", type=click.Choice(["greedy", "cdhit", "mmseqs"]), help="Clustering algorithm.")
-@click.option("--type", "seq_type", default=None, type=click.Choice(["dna", "rna", "protein"]), help="Restrict clustering to records of this type.")
-@click.option("--tag", default=None, help="Restrict clustering to records with this tag.")
-@click.option("--similarity", "similarity_method", default="kmer", type=click.Choice(["kmer", "minhash"]), help="Similarity proxy for --method greedy and for centroid selection.")
+@click.option("--method", default="greedy", type=click.Choice(["greedy", "hierarchical", "cdhit", "mmseqs"]), help="Clustering algorithm.")
+@click.option("--similarity", "similarity_method", default="kmer", type=click.Choice(["kmer", "minhash"]), help="Similarity proxy for --method greedy/hierarchical and for centroid selection.")
 @click.option("--k", "kmer_k", type=int, default=None)
 @click.option("--threshold", type=float, default=0.8, help="Similarity threshold for --method greedy (0-1).")
+@click.option("--linkage", "linkage_method", default="average", type=click.Choice(["single", "complete", "average", "weighted"]), help="Linkage criterion for --method hierarchical.")
+@click.option("--distance-threshold", type=float, default=None, help="Cut the dendrogram at this distance (--method hierarchical; default 0.3, mutually exclusive with --n-clusters).")
+@click.option("--n-clusters", type=int, default=None, help="Cut the dendrogram to exactly this many clusters (--method hierarchical; mutually exclusive with --distance-threshold).")
 @click.option("--identity", type=float, default=0.9, help="Sequence identity for --method cdhit (0-1).")
 @click.option("--min-seq-id", type=float, default=0.9, help="Minimum sequence identity for --method mmseqs (0-1).")
 @click.option("--no-consensus", is_flag=True, help="Skip consensus computation (faster; representative/centroid still computed).")
 @click.option("--msa-tool", default="mafft", type=click.Choice(["mafft", "muscle", "clustalo", "none"]), help="MSA tool for consensus of variable-length clusters; 'none' disables the fallback alignment step.")
 @click.option("--save-as", default=None, help="If 'project', write cluster tags/metadata back into the project.")
-def cluster_cmd(method, seq_type, tag, similarity_method, kmer_k, threshold, identity, min_seq_id, no_consensus, msa_tool, save_as) -> None:
+@shared_filter_options
+def cluster_cmd(method, similarity_method, kmer_k, threshold, linkage_method, distance_threshold, n_clusters, identity, min_seq_id, no_consensus, msa_tool, save_as, **sel) -> None:
     """Cluster the current project's sequences (spec section 12) and pick a
-    representative/centroid/consensus for each cluster."""
+    representative/centroid/consensus for each cluster. Restrict the input
+    with the shared selection options (--tag/--type/--field/... and their
+    --exclude-* counterparts)."""
     collection = project.load_collection()
-    targets = collection
-    if seq_type:
-        targets = targets.filter(lambda r: r.seq_type.value == seq_type)
-    if tag:
-        targets = targets.filter(lambda r: r.has_tag(tag))
-    records = list(targets)
+    records = list(_apply_shared_filters(collection, **sel))
     if not records:
         raise click.ClickException("no records matched the given filters")
 
     try:
         if method == "greedy":
             clusters = cluster_greedy(records, method=similarity_method, k=kmer_k, threshold=threshold)
+        elif method == "hierarchical":
+            clusters = cluster_hierarchical(
+                records, method=similarity_method, k=kmer_k, linkage_method=linkage_method,
+                distance_threshold=distance_threshold, n_clusters=n_clusters,
+            )
         elif method == "cdhit":
             clusters = cluster_cdhit(records, seq_type=records[0].seq_type, identity=identity)
         else:
             clusters = cluster_mmseqs(records, min_seq_id=min_seq_id)
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         raise click.ClickException(str(e))
 
     annotate_clusters(
@@ -445,19 +558,25 @@ def cluster_cmd(method, seq_type, tag, similarity_method, kmer_k, threshold, ide
 
 @main.command("tree")
 @click.argument("alignment_file", required=False, type=click.Path(exists=True, path_type=Path))
-@click.option("--name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given (from `bio align --name`).")
+@click.option("--alignment-name", "alignment_name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given (from `bio align --save-as`).")
 @click.option("--method", default="nj", type=click.Choice(["nj", "upgma", "iqtree", "fasttree", "raxml"]), help="Tree-building method.")
 @click.option("--model", default=None, help="Substitution model (nj/upgma: Bio.Phylo model name, e.g. identity/blastn/blosum62; iqtree/raxml: model string).")
 @click.option("--bootstrap", type=int, default=0, help="Bootstrap replicates for --method nj/upgma (0 disables).")
-@click.option("--save-as", default="default", help="Name to save the tree under (.bioexplorer/trees/<name>.nwk).")
+@click.option("--save-as", "save_name", default="default", help="Name to save the tree under (.bioexplorer/trees/<name>.nwk).")
 @click.option("--output", type=click.Path(path_type=Path), default=None, help="Also write the Newick tree to this path.")
-def tree_cmd(alignment_file, name, method, model, bootstrap, save_as, output) -> None:
+@shared_filter_options
+def tree_cmd(alignment_file, alignment_name, method, model, bootstrap, save_name, output, **sel) -> None:
     """Build a phylogenetic tree from an alignment (spec section 14) and
-    save it as Newick."""
+    save it as Newick. The shared selection options (--tag/--field/... and
+    --exclude-*) restrict the tree to a subset of the alignment (e.g. one
+    cluster) without editing the alignment file itself."""
     try:
-        records = _load_alignment(alignment_file, name)
+        records = _load_alignment(alignment_file, alignment_name)
     except FileNotFoundError as e:
         raise click.ClickException(str(e))
+    records = _select_alignment_records(_enrich_with_project_metadata(records, project.load_collection()), **sel)
+    if len(records) < 2:
+        raise click.ClickException(f"only {len(records)} alignment record(s) matched the given selection; a tree needs at least 2")
 
     try:
         if method in ("nj", "upgma"):
@@ -471,8 +590,8 @@ def tree_cmd(alignment_file, name, method, model, bootstrap, save_as, output) ->
     click.echo(f"built {method} tree: {summary['n_taxa']} taxa, {summary['n_internal_nodes']} internal nodes")
     click.echo(f"total branch length: {summary['total_branch_length']:.4f}")
 
-    saved_path = project.save_tree(tree, name=save_as)
-    click.echo(f"saved tree as '{save_as}' -> {saved_path}")
+    saved_path = project.save_tree(tree, name=save_name)
+    click.echo(f"saved tree as '{save_name}' -> {saved_path}")
     if output is not None:
         from .tree import write_newick
         write_newick(tree, output)
@@ -577,25 +696,20 @@ def structure_map_conservation_cmd(pdb_path, chain, alignment_file, name, output
 @click.argument("ids", nargs=-1, required=False)
 @click.option("--method", default="NG86", type=click.Choice(["NG86", "LWL85", "YN00"]), help="NG86/LWL85 are pure Python (Nei-Gojobori / Li-Wu-Luo); YN00 uses PAML's yn00 binary.")
 @click.option("--all", "all_pairs", is_flag=True, help="Compute all-pairs dN/dS across the (optionally filtered) project instead of a single pair.")
-@click.option("--type", "seq_type", default=None, type=click.Choice(["dna", "rna"]), help="Restrict --all to records of this type.")
-@click.option("--tag", default=None, help="Restrict --all to records with this tag.")
-def dnds_cmd(ids, method, all_pairs, seq_type, tag) -> None:
+@shared_filter_options
+def dnds_cmd(ids, method, all_pairs, **sel) -> None:
     """dN/dS (Ka/Ks) between codon-aligned coding sequences (spec section 13).
 
     `bio dnds ID1 ID2` for a single pair, or `bio dnds --all` for every
-    pair in the project (optionally filtered by --type/--tag). Sequences
-    must be codon-aligned: equal length, a multiple of 3.
+    pair in the project (restrict with the shared selection options --
+    --tag/--type/--field/... and their --exclude-* counterparts).
+    Sequences must be codon-aligned: equal length, a multiple of 3.
     """
     collection = project.load_collection()
 
     try:
         if all_pairs:
-            targets = collection
-            if seq_type:
-                targets = targets.filter(lambda r: r.seq_type.value == seq_type)
-            if tag:
-                targets = targets.filter(lambda r: r.has_tag(tag))
-            records = list(targets)
+            records = list(_apply_shared_filters(collection, **sel))
             if len(records) < 2:
                 raise click.ClickException("need at least 2 records for --all")
             results = dn_ds_matrix(records, method=method)
@@ -629,16 +743,21 @@ def plot_group() -> None:
 
 @plot_group.command("alignment")
 @click.argument("alignment_file", required=False, type=click.Path(exists=True, path_type=Path))
-@click.option("--name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given.")
+@click.option("--alignment-name", "alignment_name", default="default", help="Named alignment to use if ALIGNMENT_FILE is not given.")
 @click.option("--color-by", default="residue", type=click.Choice(["residue", "conservation"]))
 @click.option("--max-positions", type=int, default=200, help="Truncate to this many positions (0 = no limit).")
 @click.option("--output", type=click.Path(path_type=Path), default=Path("alignment.png"))
-def plot_alignment_cmd(alignment_file, name, color_by, max_positions, output) -> None:
-    """Render a Jalview-style colored alignment viewer."""
+@shared_filter_options
+def plot_alignment_cmd(alignment_file, alignment_name, color_by, max_positions, output, **sel) -> None:
+    """Render a Jalview-style colored alignment viewer. Accepts the shared
+    selection options to show just a subset of the alignment."""
     try:
-        records = _load_alignment(alignment_file, name)
+        records = _load_alignment(alignment_file, alignment_name)
     except FileNotFoundError as e:
         raise click.ClickException(str(e))
+    records = _select_alignment_records(_enrich_with_project_metadata(records, project.load_collection()), **sel)
+    if len(records) < 1:
+        raise click.ClickException("no alignment records matched the given selection")
     from . import viz
     try:
         viz.plot_alignment_viewer(
@@ -653,19 +772,36 @@ def plot_alignment_cmd(alignment_file, name, color_by, max_positions, output) ->
 
 @plot_group.command("tree")
 @click.argument("tree_file", required=False, type=click.Path(exists=True, path_type=Path))
-@click.option("--name", default="default", help="Named project tree to use if TREE_FILE is not given (from `bio tree --save-as`).")
+@click.option("--tree-name", "tree_name", default="default", help="Named project tree to use if TREE_FILE is not given (from `bio tree --save-as`).")
 @click.option("--no-confidence", is_flag=True, help="Hide bootstrap/confidence branch labels.")
 @click.option("--output", type=click.Path(path_type=Path), default=Path("tree.png"))
-def plot_tree_cmd(tree_file, name, no_confidence, output) -> None:
-    """Render a phylogenetic tree as a dendrogram."""
-    from .tree import read_newick
+@shared_filter_options
+def plot_tree_cmd(tree_file, tree_name, no_confidence, output, **sel) -> None:
+    """Render a phylogenetic tree as a dendrogram. The shared selection
+    options (--tag/--field/... and --exclude-*) prune the tree to a subset
+    of taxa (matched against the project by name) without touching the
+    saved tree file."""
+    from .tree import prune_tree_to_names, read_newick
     if tree_file is not None:
         tree = read_newick(tree_file)
     else:
         try:
-            tree = project.load_tree(name)
+            tree = project.load_tree(tree_name)
         except FileNotFoundError as e:
             raise click.ClickException(str(e))
+
+    if any(v for k, v in sel.items() if k != "sel_name_regex"):
+        taxa_names = [t.name for t in tree.get_terminals()]
+        stub_records = _enrich_with_project_metadata(
+            [BioRecord(name=n, sequence="", seq_type=SeqType.DNA, seq_id=n) for n in taxa_names],
+            project.load_collection(),
+        )
+        keep = {r.name for r in _select_alignment_records(stub_records, **sel)}
+        try:
+            tree = prune_tree_to_names(tree, keep)
+        except ValueError as e:
+            raise click.ClickException(str(e))
+
     from . import viz
     try:
         viz.plot_tree(tree, output, show_confidence=not no_confidence)
@@ -708,15 +844,16 @@ def replay_cmd(dry_run, from_index, to_index, skip_str, continue_on_error, no_re
 
     for step in report.steps:
         cmd_str = " ".join(step.argv)
+        rewritten_note = " (id rewritten)" if getattr(step, "ids_rewritten", False) else ""
         if step.status == "would_execute":
             click.echo(f"[{step.index}] would run: bio {cmd_str}")
         elif step.status == "skipped":
             click.echo(f"[{step.index}] skipped: bio {cmd_str}")
         elif step.status == "executed":
-            click.echo(f"[{step.index}] ok: bio {cmd_str}")
+            click.echo(f"[{step.index}] ok: bio {cmd_str}{rewritten_note}")
         else:
             last_line = step.error.strip().splitlines()[-1] if step.error and step.error.strip() else "(no output captured)"
-            click.echo(f"[{step.index}] FAILED: bio {cmd_str}\n    {last_line}")
+            click.echo(f"[{step.index}] FAILED: bio {cmd_str}{rewritten_note}\n    {last_line}")
 
     if not dry_run:
         click.echo(
@@ -733,22 +870,17 @@ def replay_cmd(dry_run, from_index, to_index, skip_str, continue_on_error, no_re
 @click.option("--model", "model_name", default=None, help="Model name/checkpoint for --method esm/prott5.")
 @click.option("--reduce", "reduce_method", default="pca", type=click.Choice(["pca", "tsne", "umap"]), help="Dimensionality reduction.")
 @click.option("--n-components", type=int, default=2)
-@click.option("--type", "seq_type", default=None, type=click.Choice(["dna", "rna", "protein"]), help="Restrict to records of this type.")
-@click.option("--tag", default=None, help="Restrict to records with this tag.")
 @click.option("--export", "export_path", type=click.Path(path_type=Path), default=None, help="Write coordinates (csv/json) to this path.")
 @click.option("--plot", "plot_output", type=click.Path(path_type=Path), default=None, help="Also render a Sequence Space scatter plot to this path.")
 @click.option("--color-by", default=None, help="Metadata/tag field to color the plot by, e.g. seq_type or cluster_id. Defaults to seq_type when available.")
-def embed_cmd(embed_method, kmer_k, model_name, reduce_method, n_components, seq_type, tag, export_path, plot_output, color_by) -> None:
+@shared_filter_options
+def embed_cmd(embed_method, kmer_k, model_name, reduce_method, n_components, export_path, plot_output, color_by, **sel) -> None:
     """Sequence space analysis (spec section 15): embed sequences into
     vectors (k-mer/MinHash/ESM/ProtT5) and reduce to 2-3D (PCA/t-SNE/UMAP)
-    for visualization."""
+    for visualization. Restrict the input with the shared selection
+    options (--tag/--type/--field/... and their --exclude-* counterparts)."""
     collection = project.load_collection()
-    targets = collection
-    if seq_type:
-        targets = targets.filter(lambda r: r.seq_type.value == seq_type)
-    if tag:
-        targets = targets.filter(lambda r: r.has_tag(tag))
-    records = list(targets)
+    records = list(_apply_shared_filters(collection, **sel))
     if len(records) < 2:
         raise click.ClickException(f"only {len(records)} record(s) matched -- sequence space analysis needs at least 2")
 
@@ -1088,6 +1220,117 @@ def annotate_interpro_cmd(tag, email, timeout, interval) -> None:
         click.echo(f"{rec.name}: {n_matches} match(es)")
     project.save_collection(collection)
     project.log_command()
+
+
+@main.command("report")
+@click.option("--by", "by_specs", multiple=True, required=True, help="Axis spec, repeatable for an N-dimensional crosstab: type / tag:<name> / tag_prefix:<prefix> / field:<dotted.key> / field:<dotted.key>:bin<width>.")
+@click.option("--export", "export_path", type=click.Path(path_type=Path), default=None, help="Write the crosstab to this CSV.")
+@shared_filter_options
+def report_cmd(by_specs, export_path, **sel) -> None:
+    """Crosstab record counts across any combination of tag/type/metadata
+    axes (not in the spec -- e.g. `bio report --by type --by
+    tag_prefix:cluster_` to see how many of each seq_type fell into each
+    cluster). Restrict the scope first with the shared selection options."""
+    collection = project.load_collection()
+    selected = list(_apply_shared_filters(collection, **sel))
+    try:
+        rows = bio_report.build_report(selected, list(by_specs))
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    header = list(by_specs) + ["count"]
+    click.echo("\t".join(header))
+    for row in rows:
+        click.echo("\t".join(str(row[h]) for h in header))
+    click.echo(f"-- {len(rows)} combination(s) over {len(selected)} record(s)", err=True)
+
+    if export_path is not None:
+        import csv as csv_mod
+        with open(export_path, "w", newline="") as fh:
+            writer = csv_mod.DictWriter(fh, fieldnames=header)
+            writer.writeheader()
+            writer.writerows(rows)
+        click.echo(f"exported report to {export_path}", err=True)
+
+    project.log_command()
+
+
+@main.command("clean")
+@click.option("--dedup-sequence", is_flag=True, help="Drop records whose sequence is identical to one already kept (first-wins).")
+@click.option("--dedup-name", is_flag=True, help="Drop records whose name is identical to one already kept (first-wins).")
+@click.option("--strip-gaps", "strip_gaps_flag", is_flag=True, help="Remove '-'/'.' gap characters from the raw sequence.")
+@click.option("--trim-ambiguous-ends", is_flag=True, help="Trim leading/trailing ambiguous symbols (N/IUPAC codes for DNA/RNA, X for protein).")
+@click.option("--max-ambiguous-fraction", type=float, default=None, help="Drop records whose ambiguous-symbol fraction (after other steps) exceeds this (0-1).")
+@click.option("--result-min-length", "clean_min_length", type=int, default=None, help="Drop records shorter than this after other cleaning steps (distinct from the pre-selection --min-length above).")
+@click.option("--result-max-length", "clean_max_length", type=int, default=None, help="Drop records longer than this after other cleaning steps (distinct from the pre-selection --max-length above).")
+@click.option("--adapter", default=None, help="Adapter sequence to trim (exact match).")
+@click.option("--adapter-end", default="both", type=click.Choice(["5", "3", "both"]), help="Which end(s) to trim --adapter from.")
+@click.option("--min-quality", type=int, default=None, help="Sliding-window Phred quality trim from both ends (FASTQ imports only -- records without quality scores are left alone).")
+@click.option("--quality-window", type=int, default=4, help="Window size for --min-quality's sliding average.")
+@click.option("--dry-run", is_flag=True, help="Report what would change without saving to the project.")
+@shared_filter_options
+def clean_cmd(dedup_sequence, dedup_name, strip_gaps_flag, trim_ambiguous_ends, max_ambiguous_fraction, clean_min_length, clean_max_length, adapter, adapter_end, min_quality, quality_window, dry_run, **sel) -> None:
+    """Sequence cleanup/QC (not in the spec): dedup, gap/adapter/ambiguous-end
+    trimming, length/ambiguity filtering, and FASTQ quality trimming.
+    Restrict scope with the shared selection options (--tag/--type/--field/...
+    and their --exclude-* counterparts) -- unselected records are left
+    untouched. By default the project is cleaned and saved back; use
+    --dry-run to preview the counts first."""
+    requested = any([
+        dedup_sequence, dedup_name, strip_gaps_flag, trim_ambiguous_ends,
+        max_ambiguous_fraction is not None, clean_min_length is not None,
+        clean_max_length is not None, adapter, min_quality is not None,
+    ])
+    if not requested:
+        raise click.ClickException(
+            "no cleaning operation given -- pass at least one of "
+            "--dedup-sequence/--dedup-name/--strip-gaps/--trim-ambiguous-ends/"
+            "--max-ambiguous-fraction/--result-min-length/--result-max-length/--adapter/--min-quality"
+        )
+
+    collection = project.load_collection()
+    targets = list(_apply_shared_filters(collection, **sel))
+    if not targets:
+        raise click.ClickException("no records matched the given filters")
+    target_ids = {r.seq_id for r in targets}
+    untouched = [r for r in collection if r.seq_id not in target_ids]
+
+    try:
+        report = clean_records(
+            targets,
+            dedup_sequence=dedup_sequence, dedup_name=dedup_name,
+            strip_gaps_flag=strip_gaps_flag, trim_ambiguous=trim_ambiguous_ends,
+            max_ambiguous_fraction=max_ambiguous_fraction,
+            min_length=clean_min_length, max_length=clean_max_length,
+            adapter=adapter, adapter_end=adapter_end,
+            min_quality=min_quality, quality_window=quality_window,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(f"{len(targets)} record(s) selected -> {report.kept} kept")
+    for label, count in (
+        ("gap-stripped", report.trimmed_gaps),
+        ("adapter-trimmed", report.trimmed_adapter),
+        ("quality-trimmed", report.trimmed_quality),
+        ("ambiguous-end-trimmed", report.trimmed_ambiguous_ends),
+        ("dropped (duplicate sequence)", report.dropped_duplicate_sequence),
+        ("dropped (duplicate name)", report.dropped_duplicate_name),
+        ("dropped (length out of range)", report.dropped_length),
+        ("dropped (too ambiguous)", report.dropped_ambiguous),
+        ("dropped (empty after trimming)", report.dropped_empty),
+    ):
+        if count:
+            click.echo(f"  {label}: {count}")
+
+    if dry_run:
+        click.echo("(dry run -- project not modified)", err=True)
+        return
+
+    new_collection = BioCollection(untouched + report.kept_records)
+    project.save_collection(new_collection)
+    project.log_command()
+    click.echo(f"project updated: {len(new_collection)} record(s) total")
 
 
 if __name__ == "__main__":

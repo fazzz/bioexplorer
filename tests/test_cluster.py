@@ -6,6 +6,7 @@ from bioexplorer.cluster import (
     assign_centroid,
     cluster_cdhit,
     cluster_greedy,
+    cluster_hierarchical,
     cluster_mmseqs,
     compute_consensus,
 )
@@ -50,6 +51,120 @@ def test_cluster_greedy_representative_is_longest_first_processed():
 
 def test_cluster_greedy_empty_input():
     assert cluster_greedy([]) == []
+
+
+try:
+    import scipy  # noqa: F401
+
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+needs_scipy = pytest.mark.skipif(not HAS_SCIPY, reason="requires scipy (the 'cluster' extra)")
+
+
+@needs_scipy
+def test_cluster_hierarchical_groups_similar_separates_unrelated(records):
+    clusters = cluster_hierarchical(records, method="kmer", distance_threshold=0.5)
+    assert len(clusters) == 2
+    sizes = sorted(len(c.members) for c in clusters)
+    assert sizes == [1, 2]
+    big_cluster = max(clusters, key=lambda c: len(c.members))
+    names = {m.name for m in big_cluster.members}
+    assert names == {"a1", "a2"}
+
+
+@needs_scipy
+def test_cluster_hierarchical_n_clusters_exact_count(records):
+    clusters = cluster_hierarchical(records, n_clusters=2)
+    assert len(clusters) == 2
+    total_members = sum(len(c.members) for c in clusters)
+    assert total_members == len(records)
+
+
+@needs_scipy
+def test_cluster_hierarchical_n_clusters_one_group(records):
+    clusters = cluster_hierarchical(records, n_clusters=1)
+    assert len(clusters) == 1
+    assert len(clusters[0].members) == len(records)
+
+
+@needs_scipy
+def test_cluster_hierarchical_representative_is_longest_member():
+    short = BioRecord(name="short", sequence="ACGTACGT", seq_type=SeqType.DNA)
+    long_ = BioRecord(name="long", sequence=SEQ_A, seq_type=SeqType.DNA)
+    clusters = cluster_hierarchical([short, long_], n_clusters=1)
+    assert clusters[0].representative.name == "long"
+
+
+def test_cluster_hierarchical_empty_input():
+    # short-circuits before ever touching scipy -- must pass with or without it
+    assert cluster_hierarchical([]) == []
+
+
+def test_cluster_hierarchical_single_record():
+    # likewise short-circuits before scipy is needed
+    rec = BioRecord(name="only", sequence=SEQ_A, seq_type=SeqType.DNA)
+    clusters = cluster_hierarchical([rec])
+    assert len(clusters) == 1
+    assert clusters[0].members == [rec]
+    assert clusters[0].representative is rec
+
+
+def test_cluster_hierarchical_both_threshold_and_n_clusters_raises(records):
+    # validated before scipy is imported -- must raise with or without it
+    with pytest.raises(ValueError, match="either"):
+        cluster_hierarchical(records, distance_threshold=0.3, n_clusters=2)
+
+
+def test_cluster_hierarchical_n_clusters_out_of_range_raises(records):
+    with pytest.raises(ValueError, match="between"):
+        cluster_hierarchical(records, n_clusters=10)
+
+
+def test_cluster_hierarchical_unknown_linkage_raises(records):
+    with pytest.raises(ValueError, match="linkage"):
+        cluster_hierarchical(records, linkage_method="ward")
+
+
+@needs_scipy
+def test_cluster_hierarchical_linkage_methods_all_run(records):
+    for linkage_method in ("single", "complete", "average", "weighted"):
+        clusters = cluster_hierarchical(records, linkage_method=linkage_method, n_clusters=2)
+        assert sum(len(c.members) for c in clusters) == len(records)
+
+
+@needs_scipy
+def test_cluster_hierarchical_minhash_similarity(records):
+    clusters = cluster_hierarchical(records, method="minhash", distance_threshold=0.5)
+    total_members = sum(len(c.members) for c in clusters)
+    assert total_members == len(records)
+
+
+def test_cluster_hierarchical_missing_scipy_raises_clear_error(records, monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "scipy.cluster.hierarchy" or name.startswith("scipy"):
+            raise ImportError("simulated: scipy not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(RuntimeError, match="scipy"):
+        cluster_hierarchical(records, n_clusters=2)
+
+
+@needs_scipy
+def test_annotate_clusters_works_with_hierarchical(records):
+    clusters = cluster_hierarchical(records, distance_threshold=0.5)
+    annotate_clusters(clusters, compute_consensus_seqs=True, msa_tool=None)
+    for cluster in clusters:
+        assert cluster.centroid is not None
+        assert cluster.consensus is not None
+        for member in cluster.members:
+            assert member.get("cluster_id") == cluster.cluster_id
 
 
 def test_assign_centroid_singleton_matches_representative():

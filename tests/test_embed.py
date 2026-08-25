@@ -18,6 +18,23 @@ from bioexplorer.embed import (
     reduce_umap,
 )
 
+try:
+    import sklearn  # noqa: F401
+
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
+try:
+    import umap  # noqa: F401
+
+    HAS_UMAP = True
+except ImportError:
+    HAS_UMAP = False
+
+needs_sklearn = pytest.mark.skipif(not HAS_SKLEARN, reason="requires scikit-learn (the 'cluster' extra)")
+needs_umap = pytest.mark.skipif(not HAS_UMAP, reason="requires umap-learn (the 'embed' extra)")
+
 
 def _dna_records(n=8):
     import random
@@ -107,6 +124,7 @@ def test_prott5_embed_missing_dependency_raises_clear_error():
         prott5_embed(_protein_records(3))
 
 
+@needs_sklearn
 def test_reduce_pca_shape():
     records = _dna_records(8)
     vectors = kmer_embed(records, k=2)
@@ -114,6 +132,7 @@ def test_reduce_pca_shape():
     assert coords.shape == (8, 2)
 
 
+@needs_sklearn
 def test_reduce_pca_component_capped_by_n_samples():
     vectors = np.random.RandomState(0).rand(2, 16)  # only 2 samples
     coords = reduce_pca(vectors, n_components=2)
@@ -121,6 +140,7 @@ def test_reduce_pca_component_capped_by_n_samples():
     assert coords.shape[1] <= 2
 
 
+@needs_sklearn
 def test_reduce_tsne_shape():
     records = _dna_records(10)
     vectors = kmer_embed(records, k=2)
@@ -128,12 +148,14 @@ def test_reduce_tsne_shape():
     assert coords.shape == (10, 2)
 
 
+@needs_sklearn
 def test_reduce_tsne_too_few_samples_raises():
     vectors = np.random.RandomState(0).rand(2, 16)
     with pytest.raises(ValueError, match="at least 4"):
         reduce_tsne(vectors)
 
 
+@needs_umap
 def test_reduce_umap_shape():
     records = _dna_records(10)
     vectors = kmer_embed(records, k=2)
@@ -141,6 +163,7 @@ def test_reduce_umap_shape():
     assert coords.shape == (10, 2)
 
 
+@needs_sklearn
 def test_reduce_sequence_space_dispatch():
     records = _dna_records(8)
     vectors = kmer_embed(records, k=2)
@@ -152,6 +175,7 @@ def test_reduce_sequence_space_unknown_method_raises():
         reduce_sequence_space(np.random.rand(5, 4), method="not-a-method")
 
 
+@needs_sklearn
 def test_build_sequence_space_end_to_end():
     records = _dna_records(8)
     result = build_sequence_space(records, embed_method="kmer", reduce_method="pca", embed_kwargs={"k": 2})

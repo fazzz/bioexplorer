@@ -1,0 +1,72 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: core (no optional extras)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Deliberately no --extra flags: exercises the CLI/core modules that
+      # must work with nothing beyond biopython+click, and the extras
+      # guards in the test suite (skip, don't fail, when scikit-learn/
+      # umap-learn/matplotlib aren't installed).
+      - name: Install (core only)
+        run: uv sync --extra dev
+
+      - name: Run tests
+        run: uv run pytest -q -rs
+
+  full:
+    name: full (cluster + embed + viz + parquet extras)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # cairosvg (part of the viz extra) links against the system Cairo
+      # library at import time, not just at render time.
+      - name: Install system dependencies (libcairo2, for the viz extra)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2
+
+      - name: Install (all extras)
+        run: uv sync --extra cluster --extra embed --extra viz --extra parquet --extra dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Smoke-test the CLI end to end on real data
+        run: |
+          uv run bio import examples/opuntia/opuntia_raw.fasta
+          uv run bio descriptor
+          uv run bio status
+          uv run bio search examples/opuntia/opuntia_raw.fasta --method kmer --top-n 3
+          uv run bio cluster --method greedy --threshold 0.9 --save-as project
+          uv run bio embed --method kmer --k 2 --reduce pca --plot /tmp/space.png
+          uv run bio report --by type --by tag_prefix:cluster_
+          uv run bio export /tmp/opuntia.parquet
+          rm -rf .bioexplorer

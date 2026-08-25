@@ -76,6 +76,38 @@ def test_csv_export(tmp_path: Path, sample_collection: BioCollection):
     assert text.count("\n") >= 4  # header + 3 records (+ trailing newline)
 
 
+def test_parquet_export_roundtrip(tmp_path: Path, sample_collection: BioCollection):
+    pd = pytest.importorskip("pandas", reason="requires the 'parquet' extra")
+    pytest.importorskip("pyarrow", reason="requires the 'parquet' extra")
+    out = tmp_path / "out.parquet"
+    write_collection(sample_collection, out, "parquet")
+    df = pd.read_parquet(out)
+    assert len(df) == len(sample_collection)
+    assert set(df["name"]) == {"dna1", "dna2", "prot1"}
+    assert "seq_id" in df.columns
+
+
+def test_parquet_export_missing_dependency_error_names_a_real_extra(tmp_path, sample_collection, monkeypatch):
+    """Regression test: the error used to point at a nonexistent '.[export]'
+    extra (pyproject.toml only ever defined cluster/embed/viz). It must now
+    name the actual 'parquet' extra."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "pandas":
+            raise ImportError("simulated: pandas not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(RuntimeError) as exc_info:
+        write_collection(sample_collection, tmp_path / "out.parquet", "parquet")
+    message = str(exc_info.value)
+    assert "[parquet]" in message
+    assert "[export]" not in message
+
+
 def test_directory_import(tmp_path: Path):
     (tmp_path / "a.fasta").write_text(">a\nACGTACGT\n")
     (tmp_path / "b.fasta").write_text(">b\nACGTTTTT\n")
